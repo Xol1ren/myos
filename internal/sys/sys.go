@@ -42,6 +42,7 @@ type MountSpec struct {
 // earlyMounts is the ordered boot-time mount table.
 var earlyMounts = []MountSpec{
 	{"devtmpfs", "/dev", "devtmpfs", 0, ""},
+	{"devpts", "/dev/pts", "devpts", syscall.MS_NOSUID | syscall.MS_NOEXEC, "ptmxmode=0666,mode=620"},
 	{"proc", "/proc", "proc", syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC, ""},
 	{"sysfs", "/sys", "sysfs", syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC, ""},
 	{"tmpfs", "/tmp", "tmpfs", syscall.MS_NOSUID | syscall.MS_NODEV, "mode=1777"},
@@ -79,13 +80,14 @@ func MountEarly() error {
 	if err := ValidateMounts(earlyMounts); err != nil {
 		return err
 	}
-	for _, d := range []string{"/dev", "/proc", "/sys", "/tmp", "/etc", "/root"} {
+	for _, d := range []string{"/dev", "/dev/pts", "/proc", "/sys", "/tmp", "/etc", "/root"} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}
 	}
 	var firstErr error
 	for _, m := range earlyMounts {
+		_ = os.MkdirAll(m.Target, 0o755)
 		if err := Mount(m.Source, m.Target, m.FSType, m.Flags, m.Data); err != nil && firstErr == nil {
 			firstErr = err
 		}

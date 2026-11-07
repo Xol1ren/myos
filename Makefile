@@ -44,8 +44,9 @@ test-race:
 build: $(INITRAMFS)
 
 $(INIT_BIN): $(SRCS)
-	@mkdir -p $(ROOTFS)/dev $(ROOTFS)/proc $(ROOTFS)/sys $(ROOTFS)/tmp $(ROOTFS)/etc
+	@mkdir -p $(ROOTFS)/dev $(ROOTFS)/proc $(ROOTFS)/sys $(ROOTFS)/tmp $(ROOTFS)/etc $(ROOTFS)/bin
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags="-s -w" -o $(INIT_BIN) ./cmd/init
+	@ln -sf /init $(ROOTFS)/bin/sh
 
 $(INITRAMFS): $(INIT_BIN) scripts/mkmodules.sh Makefile
 	@rm -rf $(ROOTFS)/lib $(ROOTFS)/etc/modules

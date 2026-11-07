@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -21,6 +22,13 @@ func logf(format string, a ...any) { fmt.Fprintf(os.Stderr, "[init] "+format+"\n
 
 func main() {
 	log.SetFlags(0)
+	if (len(os.Args) > 1 && (os.Args[1] == "-shell" || os.Args[1] == "sh" || os.Args[1] == "-sh")) || filepath.Base(os.Args[0]) == "sh" {
+		if os.Getenv("TERM") == "" {
+			_ = os.Setenv("TERM", "linux")
+		}
+		shell.New(nil).Run()
+		return
+	}
 	pid1 := os.Getpid() == 1
 	if pid1 {
 		if err := sys.MountEarly(); err != nil {

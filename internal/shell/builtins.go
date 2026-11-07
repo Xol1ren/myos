@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"myos/internal/fb"
 	"myos/internal/input"
 	"myos/internal/monitor"
+	"myos/internal/netcfg"
 	"myos/internal/sys"
 )
 
@@ -46,6 +48,8 @@ func init() {
 		"help":     biHelp,
 		"syshud":   biSyshud,
 		"gui":      biGui,
+		"disks":    biDisks,
+		"fetch":    biFetch,
 	}
 }
 
@@ -513,6 +517,89 @@ func biGui(s *Shell, io *IO, a []string) int {
 		restoreTTY()
 		fmt.Fprint(os.Stdout, "\x1b[2J\x1b[H")
 	}()
-	fb.NewDesktop(dev.Width(), dev.Height()).Run(dev, s.Mouse, waitQuit)
+	desk := fb.NewDesktop(dev.Width(), dev.Height())
+	guiWait := func(d time.Duration) bool {
+		deadline := time.Now().Add(d)
+		for {
+			k, ok, eof := pollKey(time.Until(deadline))
+			if eof {
+				return true
+			}
+			if !ok {
+				return false
+			}
+			if desk.RouteKey(k) {
+				return true
+			}
+		}
+	}
+	desk.Run(dev, s.Mouse, guiWait)
 	return 0
 }
+
+// biDisks scans and reports block storage devices: disks
+func biDisks(_ *Shell, io *IO, _ []string) int {
+	disks, err := sys.ScanDisks()
+	if err != nil {
+		fmt.Fprintf(io.Err, "disks: %v\n", err)
+		return 1
+	}
+	if len(disks) == 0 {
+		fmt.Fprintln(io.Out, "No block storage devices detected (/dev/sd*, /dev/vd*, /dev/nvme*)")
+		return 0
+	}
+	fmt.Fprintf(io.Out, "%-14s %-10s %-8s %-16s %s\n", "DEVICE", "SIZE", "TYPE", "MOUNTPOINT", "FSTYPE")
+	for _, d := range disks {
+		fmt.Fprintf(io.Out, "%-14s %-10s %-8s %-16s %s\n", d.Path, d.SizeHuman, d.Type, d.Mount, d.FSType)
+	}
+	return 0
+}
+
+// biFetch downloads files over HTTP/HTTPS: fetch <url> [-o output_file]
+func biFetch(_ *Shell, io *IO, args []string) int {
+	if len(args) < 2 {
+		fmt.Fprintln(io.Err, "usage: fetch <url> [-o output_file]")
+		return 1
+	}
+	rawURL := args[1]
+	outPath := ""
+	for i := 2; i < len(args); i++ {
+		if args[i] == "-o" && i+1 < len(args) {
+			outPath = args[i+1]
+			i++
+		}
+	}
+
+	fmt.Fprintf(io.Err, "fetching %s ...\n", rawURL)
+	start := time.Now()
+	res, err := netcfg.Fetch(context.Background(), rawURL, netcfg.FetchOptions{
+		Timeout: 30 * time.Second,
+		Out:     io.Out,
+		OutPath: outPath,
+		Progress: func(downloaded, total int64, elapsed time.Duration, done bool) {
+			if total > 0 {
+				pct := (downloaded * 100) / total
+				fmt.Fprintf(io.Err, "\r[%-20s] %d%% %s / %s", strings.Repeat("=", int(pct/5))+">", pct, sys.FormatBytes(uint64(downloaded)), sys.FormatBytes(uint64(total)))
+			} else {
+				fmt.Fprintf(io.Err, "\r%s downloaded", sys.FormatBytes(uint64(downloaded)))
+			}
+			if done {
+				fmt.Fprintln(io.Err)
+			}
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(io.Err, "fetch: %v\n", err)
+		return 1
+	}
+
+	rate := float64(res.BytesRead) / (time.Since(start).Seconds() + 0.001)
+	dest := "stdout"
+	if outPath != "" {
+		dest = outPath
+	}
+	fmt.Fprintf(io.Err, "downloaded %d bytes in %v (%s/s) -> %s (HTTP %d %s)\n",
+		res.BytesRead, res.Duration.Round(time.Millisecond), sys.FormatBytes(uint64(rate)), dest, res.StatusCode, res.StatusText)
+	return 0
+}
+

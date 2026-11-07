@@ -1,7 +1,9 @@
 package fb
 
 import (
+	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"time"
 
@@ -39,15 +41,23 @@ type Device interface {
 	Backend() string
 }
 
-// Window is the movable demo window.
+// Window is a movable window rectangle.
 type Window struct {
 	X, Y, W, H int
 	Title      string
 }
 
-// Desktop is the demo desktop: background, top bar and one draggable window.
+// Desktop is the desktop environment containing windows, topbar, and terminal.
 type Desktop struct {
-	Win Window
+	Win     Window // System Monitor window
+	TermWin Window // Terminal window
+	Term    *Terminal
+
+	focusWin    int // 0: Win (Sysmon), 1: TermWin (Terminal)
+	draggingWin int // -1: none, 0: Win, 1: TermWin
+	dragDX      int
+	dragDY      int
+	shouldQuit  bool
 
 	clicks   uint64
 	frames   uint64
@@ -55,9 +65,7 @@ type Desktop struct {
 	fpsCount int
 	fpsStamp time.Time
 
-	prevBtn        uint8
-	dragging       bool
-	dragDX, dragDY int
+	prevBtn uint8
 
 	statusAt   time.Time
 	barRight   []byte // "MEM a/b MB  IP x.x.x.x" refreshed once a second
@@ -69,41 +77,140 @@ type Desktop struct {
 	prevCPU    monitor.CPUTimes
 }
 
-// NewDesktop creates a desktop for a w*h screen.
+// NewDesktop creates a desktop with both System Monitor and Terminal windows.
 func NewDesktop(w, h int) *Desktop {
-	ww, wh := 400, 220
-	return &Desktop{
-		Win:      Window{X: max((w-ww)/2, 0), Y: max((h-wh)/2, topBarH), W: ww, H: wh, Title: "myos - pure Go desktop"},
-		fpsStamp: time.Now(),
-		scratch:  make([]byte, 0, 128),
+	// Terminal window dimensions: 70 cols x 20 rows
+	termCols, termRows := 70, 20
+	termW := termCols*GlyphW + 16
+	termH := termRows*GlyphH + titleBarH + 12
+	if termW > w-40 {
+		termCols = max((w-56)/GlyphW, 40)
+		termW = termCols*GlyphW + 16
 	}
+	if termH > h-topBarH-20 {
+		termRows = max((h-topBarH-44)/GlyphH, 10)
+		termH = termRows*GlyphH + titleBarH + 12
+	}
+
+	termX := 60
+	termY := topBarH + 32
+
+	// System monitor window
+	sysW, sysH := 420, 240
+	sysX := termX + termW + 20
+	sysY := termY
+	if sysX+sysW > w-10 {
+		sysX = max(w-sysW-20, 20)
+		sysY = max(h-sysH-20, topBarH+10)
+	}
+
+	d := &Desktop{
+		Win:         Window{X: sysX, Y: sysY, W: sysW, H: sysH, Title: "System Monitor"},
+		TermWin:     Window{X: termX, Y: termY, W: termW, H: termH, Title: "Terminal"},
+		focusWin:    1, // Default focus to terminal
+		draggingWin: -1,
+		fpsStamp:    time.Now(),
+		scratch:     make([]byte, 0, 128),
+	}
+
+	term, err := NewTerminal(termRows, termCols)
+	if err == nil {
+		d.Term = term
+		d.TermWin.Title = term.title
+	} else {
+		fmt.Fprintf(os.Stderr, "[desktop] terminal init: %v\n", err)
+	}
+
+	return d
 }
 
 func (d *Desktop) buttonRect() (x, y, w, h int) {
 	return d.Win.X + 16, d.Win.Y + titleBarH + 112, 140, 30
 }
 
+func (d *Desktop) exitButtonRect(screenW int) (x, y, w, h int) {
+	return screenW - 68, 2, 60, 20
+}
+
 func inside(px, py, x, y, w, h int) bool { return px >= x && py >= y && px < x+w && py < y+h }
 
-// Update handles mouse interaction (dragging, button clicks) for one frame.
+// RouteKey routes keyboard input from the GUI loop to the terminal or handles quit shortcuts.
+func (d *Desktop) RouteKey(k byte) bool {
+	if k == 0x11 { // Ctrl-Q exits desktop
+		d.shouldQuit = true
+		return true
+	}
+	if d.Term != nil && d.Term.IsActive() && d.focusWin == 1 {
+		_, _ = d.Term.WriteInput([]byte{k})
+		return false
+	}
+	// Fallback when terminal not focused or not active
+	if k == 'q' || k == 'Q' || k == 27 || k == 3 {
+		d.shouldQuit = true
+		return true
+	}
+	if d.Term != nil && d.Term.IsActive() {
+		_, _ = d.Term.WriteInput([]byte{k})
+	}
+	return false
+}
+
+// Update handles mouse interaction (window dragging, button clicks, focus) for one frame.
 func (d *Desktop) Update(st input.State) {
 	pressed := st.Buttons&input.Left != 0 && d.prevBtn&input.Left == 0
 	released := st.Buttons&input.Left == 0
-	w := &d.Win
+
 	if pressed {
+		// 1. Check Topbar Exit Button
+		ex, ey, ew, eh := d.exitButtonRect(st.W)
+		if inside(st.X, st.Y, ex, ey, ew, eh) {
+			d.shouldQuit = true
+		}
+
+		// 2. Check Terminal Window
+		if d.Term != nil {
+			closeBtnX := d.TermWin.X + d.TermWin.W - 20
+			if inside(st.X, st.Y, closeBtnX, d.TermWin.Y+2, 18, 18) {
+				_ = d.Term.Close()
+				d.Term = nil
+			} else if inside(st.X, st.Y, d.TermWin.X, d.TermWin.Y, d.TermWin.W, titleBarH) {
+				d.focusWin = 1
+				d.draggingWin = 1
+				d.dragDX, d.dragDY = st.X-d.TermWin.X, st.Y-d.TermWin.Y
+			} else if inside(st.X, st.Y, d.TermWin.X, d.TermWin.Y, d.TermWin.W, d.TermWin.H) {
+				d.focusWin = 1
+			}
+		}
+
+		// 3. Check System Monitor Window
+		w := &d.Win
 		if inside(st.X, st.Y, w.X, w.Y, w.W, titleBarH) {
-			d.dragging, d.dragDX, d.dragDY = true, st.X-w.X, st.Y-w.Y
-		} else if bx, by, bw, bh := d.buttonRect(); inside(st.X, st.Y, bx, by, bw, bh) {
-			d.clicks++
+			d.focusWin = 0
+			d.draggingWin = 0
+			d.dragDX, d.dragDY = st.X-w.X, st.Y-w.Y
+		} else if inside(st.X, st.Y, w.X, w.Y, w.W, w.H) {
+			d.focusWin = 0
+			if bx, by, bw, bh := d.buttonRect(); inside(st.X, st.Y, bx, by, bw, bh) {
+				d.clicks++
+			}
 		}
 	}
+
 	if released {
-		d.dragging = false
+		d.draggingWin = -1
 	}
-	if d.dragging {
+
+	// Update window positions during drag
+	if d.draggingWin == 0 {
+		w := &d.Win
 		w.X = min(max(st.X-d.dragDX, 0), max(st.W-w.W, 0))
 		w.Y = min(max(st.Y-d.dragDY, topBarH), max(st.H-w.H, topBarH))
+	} else if d.draggingWin == 1 {
+		tw := &d.TermWin
+		tw.X = min(max(st.X-d.dragDX, 0), max(st.W-tw.W, 0))
+		tw.Y = min(max(st.Y-d.dragDY, topBarH), max(st.H-tw.H, topBarH))
 	}
+
 	d.prevBtn = st.Buttons
 
 	now := time.Now()
@@ -160,23 +267,48 @@ func primaryIP() string {
 	return "no link"
 }
 
-// Draw renders the whole scene (not the cursor) into c.
+// Draw renders the whole desktop scene into c.
 func (d *Desktop) Draw(c *Canvas, st input.State, backend ...string) {
 	c.DrawFillRect(0, 0, c.W, c.H, colBackground)
 
-	// Top bar: title on the left, clock centred, memory/IP on the right.
+	// Top bar: title on the left, clock centred, memory/IP on the right, exit button.
 	c.DrawFillRect(0, 0, c.W, topBarH, colTopBar)
 	c.DrawFillRect(0, topBarH-1, c.W, 1, colTopBarLine)
 	c.DrawString(8, 4, "myos", colAccent)
 	c.DrawBytes((c.W-len(d.clock)*GlyphW)/2, 4, d.clock, colText)
-	c.DrawBytes(c.W-len(d.barRight)*GlyphW-8, 4, d.barRight, colDim)
+	c.DrawBytes(c.W-len(d.barRight)*GlyphW-76, 4, d.barRight, colDim)
 
-	// Window with a subtle shadow.
+	// Exit button on topbar
+	ex, ey, ew, eh := d.exitButtonRect(c.W)
+	c.DrawFillRect(ex, ey, ew, eh, colButton)
+	c.DrawRect(ex, ey, ew, eh, colAccent)
+	c.DrawString(ex+14, ey+2, "Exit", colText)
+
+	// Render windows according to focus order (focused window rendered last/on top)
+	if d.focusWin == 1 {
+		d.drawSysmon(c, st, backend...)
+		d.drawTerminal(c)
+	} else {
+		d.drawTerminal(c)
+		d.drawSysmon(c, st, backend...)
+	}
+}
+
+func (d *Desktop) drawTerminal(c *Canvas) {
+	if d.Term == nil {
+		return
+	}
+	tw := &d.TermWin
+	d.Term.Draw(c, tw.X, tw.Y, tw.W, tw.H, d.focusWin == 1)
+}
+
+func (d *Desktop) drawSysmon(c *Canvas, st input.State, backend ...string) {
 	w := &d.Win
 	c.DrawFillRect(w.X+5, w.Y+5, w.W, w.H, 0x060C1C)
 	c.DrawFillRect(w.X, w.Y, w.W, w.H, colWinBody)
+
 	title := colWinTitle
-	if d.dragging {
+	if d.focusWin == 0 {
 		title = colWinTitleHi
 	}
 	c.DrawFillRect(w.X, w.Y, w.W, titleBarH, title)
@@ -184,7 +316,7 @@ func (d *Desktop) Draw(c *Canvas, st input.State, backend ...string) {
 	c.DrawRect(w.X, w.Y, w.W, w.H, colTopBarLine)
 
 	tx, ty := w.X+16, w.Y+titleBarH+12
-	banner := "Native Graphics (no X11/Wayland)"
+	banner := "Native Graphics (DRM/KMS)"
 	if len(backend) > 0 && backend[0] != "" {
 		banner = backend[0]
 	}
@@ -220,7 +352,7 @@ func (d *Desktop) Draw(c *Canvas, st input.State, backend ...string) {
 	s = strconv.AppendUint(s, d.clicks, 10)
 	c.DrawBytes(bx+bw+16, by+7, s, colText)
 
-	// Graphical Syshud / System Monitor Panel (Phase 4 integration)
+	// Graphical Syshud / System Monitor Panel
 	px, py := w.X+190, w.Y+titleBarH+22
 	c.DrawString(px, py, "SYS MONITOR", colAccent)
 
@@ -249,7 +381,7 @@ func (d *Desktop) Draw(c *Canvas, st input.State, backend ...string) {
 		c.DrawFillRect(px+37, py+37, ramFill, 10, 0x2ECC71)
 	}
 
-	c.DrawString(tx, w.Y+w.H-24, "Drag title bar. Esc/q: exit", colDim)
+	c.DrawString(tx, w.Y+w.H-24, "Drag windows. Ctrl-Q / Exit", colDim)
 	d.scratch = s[:0]
 }
 
@@ -270,9 +402,15 @@ func appendButtons(s []byte, b uint8) []byte {
 }
 
 // Run drives the 60 FPS loop. wait(d) blocks up to d and returns true when
-// the user asked to quit (Esc/q). The mouse bounds are set to the screen size
+// the user asked to quit. The mouse bounds are set to the screen size
 // for the duration and restored afterwards.
 func (d *Desktop) Run(dev Device, m *input.Mouse, wait func(time.Duration) bool) {
+	defer func() {
+		if d.Term != nil {
+			_ = d.Term.Close()
+		}
+	}()
+
 	prev := m.Snapshot()
 	m.SetBounds(dev.Width(), dev.Height())
 	defer m.SetBounds(prev.W, prev.H)
@@ -282,6 +420,9 @@ func (d *Desktop) Run(dev Device, m *input.Mouse, wait func(time.Duration) bool)
 	const frame = time.Second / 60
 	next := time.Now()
 	for {
+		if d.shouldQuit {
+			return
+		}
 		st := m.Snapshot()
 		d.Update(st)
 		d.Draw(c, st, dev.Backend())
