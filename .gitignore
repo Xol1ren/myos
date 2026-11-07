@@ -1,0 +1,10 @@
+build/
+bin/
+*.iso
+*.cpio.gz
+*.ppm
+*.png
+*.log
+*.test
+*debug*.sh
+test_qemu*.sh

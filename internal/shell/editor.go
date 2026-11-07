@@ -1,0 +1,217 @@
+package shell
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"syscall"
+	"unicode/utf8"
+	"unsafe"
+
+	"myos/internal/sys"
+)
+
+func isTTY(fd int) bool {
+	var t syscall.Termios
+	return sys.Ioctl(fd, syscall.TCGETS, unsafe.Pointer(&t)) == nil
+}
+
+// makeRaw puts fd into raw mode (output post-processing stays enabled so
+// "\n" still renders as CR+LF) and returns a restore function.
+func makeRaw(fd int) (func(), error) {
+	var old syscall.Termios
+	if err := sys.Ioctl(fd, syscall.TCGETS, unsafe.Pointer(&old)); err != nil {
+		return nil, err
+	}
+	raw := old
+	raw.Iflag &^= syscall.ICRNL | syscall.INLCR | syscall.IGNCR | syscall.IXON | syscall.ISTRIP | syscall.BRKINT
+	raw.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.ISIG | syscall.IEXTEN
+	raw.Cc[syscall.VMIN], raw.Cc[syscall.VTIME] = 1, 0
+	if err := sys.Ioctl(fd, syscall.TCSETS, unsafe.Pointer(&raw)); err != nil {
+		return nil, err
+	}
+	return func() { _ = sys.Ioctl(fd, syscall.TCSETS, unsafe.Pointer(&old)) }, nil
+}
+
+// readLine reads one line with editing and history. It returns io.EOF-like
+// os.ErrClosed semantics via the eof flag when Ctrl-D is pressed on an empty line.
+func (s *Shell) readLine(prompt string) (line string, eof bool) {
+	if !s.tty {
+		l, err := s.stdin.ReadString('\n')
+		if err != nil && l == "" {
+			return "", true
+		}
+		return strings.TrimRight(l, "\r\n"), false
+	}
+	restore, err := makeRaw(0)
+	if err != nil {
+		l, err := s.stdin.ReadString('\n')
+		if err != nil && l == "" {
+			return "", true
+		}
+		return strings.TrimRight(l, "\r\n"), false
+	}
+	defer restore()
+
+	var buf []rune
+	pos := 0
+	histIdx := len(s.history)
+	saved := ""
+
+	redraw := func() {
+		var sb strings.Builder
+		sb.WriteString("\r" + prompt + string(buf) + "\x1b[K\r")
+		if col := utf8.RuneCountInString(prompt) + pos; col > 0 {
+			fmt.Fprintf(&sb, "\x1b[%dC", col)
+		}
+		_, _ = os.Stdout.WriteString(sb.String())
+	}
+	setLine := func(t string) {
+		buf = []rune(t)
+		pos = len(buf)
+	}
+	redraw()
+
+	for {
+		r, _, err := s.stdin.ReadRune()
+		if err != nil {
+			return "", true
+		}
+		switch r {
+		case '\r', '\n':
+			_, _ = os.Stdout.WriteString("\r\n")
+			return string(buf), false
+		case 3: // Ctrl-C
+			_, _ = os.Stdout.WriteString("^C\r\n")
+			return "", false
+		case 4: // Ctrl-D
+			if len(buf) == 0 {
+				_, _ = os.Stdout.WriteString("\r\n")
+				return "", true
+			}
+			if pos < len(buf) {
+				buf = append(buf[:pos], buf[pos+1:]...)
+			}
+		case 127, 8: // backspace
+			if pos > 0 {
+				buf = append(buf[:pos-1], buf[pos:]...)
+				pos--
+			}
+		case 1: // Ctrl-A
+			pos = 0
+		case 5: // Ctrl-E
+			pos = len(buf)
+		case 2: // Ctrl-B
+			if pos > 0 {
+				pos--
+			}
+		case 6: // Ctrl-F
+			if pos < len(buf) {
+				pos++
+			}
+		case 11: // Ctrl-K
+			buf = buf[:pos]
+		case 21: // Ctrl-U
+			buf = buf[pos:]
+			pos = 0
+		case 23: // Ctrl-W: delete previous word
+			i := pos
+			for i > 0 && buf[i-1] == ' ' {
+				i--
+			}
+			for i > 0 && buf[i-1] != ' ' {
+				i--
+			}
+			buf = append(buf[:i], buf[pos:]...)
+			pos = i
+		case 12: // Ctrl-L
+			_, _ = os.Stdout.WriteString("\x1b[H\x1b[2J")
+		case 16, 14: // Ctrl-P / Ctrl-N
+			s.historyMove(&histIdx, &saved, &buf, &pos, r == 16, setLine)
+		case 27:
+			s.escape(&buf, &pos, &histIdx, &saved, setLine)
+		default:
+			if r >= 32 {
+				buf = append(buf, 0)
+				copy(buf[pos+1:], buf[pos:])
+				buf[pos] = r
+				pos++
+			}
+		}
+		redraw()
+	}
+}
+
+func (s *Shell) historyMove(idx *int, saved *string, buf *[]rune, pos *int, up bool, setLine func(string)) {
+	if up {
+		if *idx == 0 {
+			return
+		}
+		if *idx == len(s.history) {
+			*saved = string(*buf)
+		}
+		*idx--
+		setLine(s.history[*idx])
+	} else {
+		if *idx >= len(s.history) {
+			return
+		}
+		*idx++
+		if *idx == len(s.history) {
+			setLine(*saved)
+		} else {
+			setLine(s.history[*idx])
+		}
+	}
+}
+
+// escape handles CSI / SS3 sequences (arrows, Home/End/Delete).
+func (s *Shell) escape(buf *[]rune, pos, histIdx *int, saved *string, setLine func(string)) {
+	r, _, err := s.stdin.ReadRune()
+	if err != nil || (r != '[' && r != 'O') {
+		return
+	}
+	var param []rune
+	var final rune
+	for {
+		c, _, err := s.stdin.ReadRune()
+		if err != nil {
+			return
+		}
+		if (c >= '0' && c <= '9') || c == ';' {
+			param = append(param, c)
+			continue
+		}
+		final = c
+		break
+	}
+	switch final {
+	case 'A':
+		s.historyMove(histIdx, saved, buf, pos, true, setLine)
+	case 'B':
+		s.historyMove(histIdx, saved, buf, pos, false, setLine)
+	case 'C':
+		if *pos < len(*buf) {
+			*pos++
+		}
+	case 'D':
+		if *pos > 0 {
+			*pos--
+		}
+	case 'H':
+		*pos = 0
+	case 'F':
+		*pos = len(*buf)
+	case '~':
+		switch string(param) {
+		case "1", "7":
+			*pos = 0
+		case "4", "8":
+			*pos = len(*buf)
+		case "3":
+			if *pos < len(*buf) {
+				*buf = append((*buf)[:*pos], (*buf)[*pos+1:]...)
+			}
+		}
+	}
+}
