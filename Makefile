@@ -9,6 +9,7 @@ MODULES  ?= e1000 ehci_pci usbhid hid_generic mousedev evdev atkbd psmouse simpl
 # Set NOGRAPHIC=1 to run on the serial console in the current terminal.
 NOGRAPHIC ?=
 MEM      ?= 512M
+QEMU_MOUSE ?= -device usb-ehci -device usb-tablet
 
 BUILD     := build
 ROOTFS    := $(BUILD)/rootfs
@@ -58,9 +59,9 @@ run: build
 	@test -n "$(KERNEL)" -a -r "$(KERNEL)" || { echo "error: no readable kernel found; pass KERNEL=/path/to/vmlinuz" >&2; exit 1; }
 	$(QEMU) $(ACCEL) -m $(MEM) -smp 2 \
 		-kernel $(KERNEL) -initrd $(INITRAMFS) \
-		-append "$(CMDLINE_TTY) quiet loglevel=3 rdinit=/init" \
+		-append "$(CMDLINE_TTY) quiet loglevel=3 rdinit=/init mousedev.xres=1280 mousedev.yres=800" \
 		-net nic,model=e1000 -net user \
-		-device usb-ehci -device usb-tablet \
+		$(QEMU_MOUSE) \
 		$(DISPLAY_ARGS)
 
 iso: build
@@ -69,7 +70,7 @@ iso: build
 # Boot the ISO via legacy BIOS from the virtual CD-ROM.
 run-iso: iso
 	$(QEMU) $(ACCEL) -cdrom $(BUILD)/myos.iso -boot d -m $(MEM) \
-		-net nic,model=e1000 -net user -device usb-ehci -device usb-tablet $(DISPLAY_ARGS)
+		-net nic,model=e1000 -net user $(QEMU_MOUSE) $(DISPLAY_ARGS)
 
 # Same, via UEFI firmware (needs OVMF; override with OVMF=/path/OVMF_CODE.fd).
 OVMF ?= $(firstword $(wildcard /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/ovmf/OVMF.fd))
@@ -77,7 +78,7 @@ run-iso-uefi: iso
 	@test -n "$(OVMF)" || { echo "error: OVMF firmware not found; pass OVMF=..." >&2; exit 1; }
 	$(QEMU) $(ACCEL) -drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
 		-cdrom $(BUILD)/myos.iso -boot d -m $(MEM) \
-		-net nic,model=e1000 -net user -device usb-ehci -device usb-tablet $(DISPLAY_ARGS)
+		-net nic,model=e1000 -net user $(QEMU_MOUSE) $(DISPLAY_ARGS)
 
 clean:
 	rm -rf $(BUILD)

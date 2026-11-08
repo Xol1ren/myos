@@ -14,7 +14,7 @@ INITRAMFS=${INITRAMFS:-$BUILD/initramfs.cpio.gz}
 OUT=${OUT:-$BUILD/myos.iso}
 STAGE=$BUILD/iso
 KERNEL=${KERNEL:-}
-CMDLINE=${CMDLINE:-"quiet loglevel=3 console=tty0 console=ttyS0,115200"}
+CMDLINE=${CMDLINE:-"quiet loglevel=3 console=tty0 console=ttyS0,115200 mousedev.xres=1280 mousedev.yres=800"}
 VOLID=MYOS
 
 die() { echo "mkiso: error: $*" >&2; exit 1; }
@@ -78,7 +78,7 @@ menuentry "myos" {
 }
 
 menuentry "myos (serial console ttyS0)" {
-	linux /boot/vmlinuz quiet loglevel=3 console=ttyS0,115200 console=tty0 myos.tty=/dev/ttyS0
+	linux /boot/vmlinuz quiet loglevel=3 console=ttyS0,115200 console=tty0 myos.tty=/dev/ttyS0 mousedev.xres=1280 mousedev.yres=800
 	initrd /boot/initramfs.cpio.gz
 }
 EOF
@@ -105,7 +105,7 @@ LABEL myos
 LABEL serial
   KERNEL /boot/vmlinuz
   INITRD /boot/initramfs.cpio.gz
-  APPEND quiet loglevel=3 console=ttyS0,115200 console=tty0 myos.tty=/dev/ttyS0
+  APPEND quiet loglevel=3 console=ttyS0,115200 console=tty0 myos.tty=/dev/ttyS0 mousedev.xres=1280 mousedev.yres=800
 EOF
 
 # --- UEFI boot image (optional) -----------------------------------------------

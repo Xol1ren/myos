@@ -36,6 +36,11 @@ func NewKeyboardListener(primaryFd int, secondaryPath string) (*KeyboardListener
 		ttyFd:     -1,
 	}
 
+	// Ensure primary descriptor is in non-blocking mode so Read never hangs the GUI
+	if primaryFd >= 0 {
+		_ = syscall.SetNonblock(primaryFd, true)
+	}
+
 	if secondaryPath != "" {
 		// Open secondary console in non-blocking mode
 		fd, err := syscall.Open(secondaryPath, syscall.O_RDWR|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
@@ -120,18 +125,16 @@ func (l *KeyboardListener) Poll(d time.Duration) (buf []byte, ok, eof bool) {
 	}
 
 	var scratch [128]byte
-	// Check primary console
+	var out []byte
+
+	// Check primary console (os.Stdin / serial)
 	if l.primaryFd >= 0 && l.primaryFd < 1024 && (fds.Bits[l.primaryFd/64]&(1<<(uint(l.primaryFd)%64))) != 0 {
 		m, err := syscall.Read(l.primaryFd, scratch[:])
 		if err == nil && m > 0 {
-			out := make([]byte, m)
-			copy(out, scratch[:m])
-			return out, true, false
-		}
-		if err != nil && err != syscall.EINTR && err != syscall.EAGAIN {
-			return nil, false, true
-		}
-		if m == 0 && err == nil {
+			out = append(out, scratch[:m]...)
+		} else if m == 0 && err == nil {
+			return nil, false, true // EOF on primary
+		} else if err != nil && err != syscall.EINTR && err != syscall.EAGAIN {
 			return nil, false, true
 		}
 	}
@@ -140,12 +143,13 @@ func (l *KeyboardListener) Poll(d time.Duration) (buf []byte, ok, eof bool) {
 	if l.ttyFd >= 0 && l.ttyFd < 1024 && (fds.Bits[l.ttyFd/64]&(1<<(uint(l.ttyFd)%64))) != 0 {
 		m, err := syscall.Read(l.ttyFd, scratch[:])
 		if err == nil && m > 0 {
-			out := make([]byte, m)
-			copy(out, scratch[:m])
-			return out, true, false
+			out = append(out, scratch[:m]...)
 		}
 	}
 
+	if len(out) > 0 {
+		return out, true, false
+	}
 	return nil, false, false
 }
 
@@ -157,6 +161,11 @@ func (l *KeyboardListener) Close() error {
 		return nil
 	}
 	l.closed = true
+
+	if l.primaryFd >= 0 {
+		_ = syscall.SetNonblock(l.primaryFd, false)
+	}
+
 	if l.restoreVT != nil {
 		l.restoreVT()
 		l.restoreVT = nil

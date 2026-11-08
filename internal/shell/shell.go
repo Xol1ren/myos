@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"myos/internal/fb"
 	"myos/internal/input"
 	"myos/internal/proc"
 )
@@ -21,20 +22,91 @@ type Shell struct {
 	Prompt string
 	Mouse  *input.Mouse
 
+	in      *os.File
+	out     *os.File
+	err     *os.File
 	stdin   *bufio.Reader
 	tty     bool
 	history []string
 	status  int
 }
 
+func init() {
+	fb.ShellWorker = func(slave *os.File) {
+		RunAttached(slave)
+	}
+}
+
 // New creates a shell bound to the process's stdin/stdout.
 func New(m *input.Mouse) *Shell {
-	return &Shell{Prompt: "myos# ", Mouse: m, stdin: bufio.NewReader(os.Stdin), tty: isTTY(0)}
+	return NewWithIO(m, os.Stdin, os.Stdout, os.Stderr)
+}
+
+// NewWithIO creates a shell with custom input/output descriptors (e.g. PTY slave).
+func NewWithIO(m *input.Mouse, in, out, err *os.File) *Shell {
+	if in == nil {
+		in = os.Stdin
+	}
+	if out == nil {
+		out = os.Stdout
+	}
+	if err == nil {
+		err = os.Stderr
+	}
+	return &Shell{
+		Prompt: "myos# ",
+		Mouse:  m,
+		in:     in,
+		out:    out,
+		err:    err,
+		stdin:  bufio.NewReader(in),
+		tty:    isTTY(int(in.Fd())),
+	}
+}
+
+// RunAttached runs an interactive shell attached to a given PTY slave or duplex file.
+func RunAttached(f *os.File) {
+	s := NewWithIO(nil, f, f, f)
+	s.Run()
+}
+
+func (s *Shell) inFile() *os.File {
+	if s.in != nil {
+		return s.in
+	}
+	return os.Stdin
+}
+
+func (s *Shell) outFile() *os.File {
+	if s.out != nil {
+		return s.out
+	}
+	return os.Stdout
+}
+
+func (s *Shell) errFile() *os.File {
+	if s.err != nil {
+		return s.err
+	}
+	return os.Stderr
 }
 
 // Run executes the REPL until EOF (Ctrl-D) or the `exit` builtin.
 func (s *Shell) Run() {
-	s.tty = isTTY(0)
+	if s.in == nil {
+		s.in = os.Stdin
+	}
+	if s.out == nil {
+		s.out = os.Stdout
+	}
+	if s.err == nil {
+		s.err = os.Stderr
+	}
+	if s.stdin == nil {
+		s.stdin = bufio.NewReader(s.in)
+	}
+	s.tty = isTTY(int(s.in.Fd()))
+
 	for {
 		line, eof := s.readLine(s.Prompt)
 		if eof {
@@ -58,7 +130,7 @@ func (s *Shell) Run() {
 		}
 		stages, err := parse(line, s.lookup)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "myos: %v\n", err)
+			fmt.Fprintf(s.errFile(), "myos: %v\n", err)
 			s.status = 2
 			continue
 		}
@@ -130,7 +202,7 @@ func (s *Shell) runStage(st stage, in, out *os.File) int {
 				}
 			}()
 		}
-		return b(s, &IO{In: in, Out: out, Err: os.Stderr}, args)
+		return b(s, &IO{In: in, Out: out, Err: s.errFile()}, args)
 	}
 	return s.runExternal(args, st.env, in, out)
 }
@@ -138,16 +210,16 @@ func (s *Shell) runStage(st stage, in, out *os.File) int {
 func (s *Shell) runExternal(args []string, extraEnv []string, in, out *os.File) int {
 	path, err := exec.LookPath(args[0])
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "myos: %s: command not found\n", args[0])
+		fmt.Fprintf(s.errFile(), "myos: %s: command not found\n", args[0])
 		return 127
 	}
 	env := os.Environ()
 	if len(extraEnv) > 0 {
 		env = append(append([]string(nil), env...), extraEnv...)
 	}
-	pid, err := proc.Spawn(path, args, env, []uintptr{in.Fd(), out.Fd(), os.Stderr.Fd()})
+	pid, err := proc.Spawn(path, args, env, []uintptr{in.Fd(), out.Fd(), s.errFile().Fd()})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "myos: %s: %v\n", args[0], err)
+		fmt.Fprintf(s.errFile(), "myos: %s: %v\n", args[0], err)
 		return 126
 	}
 	ws := proc.Wait(pid)

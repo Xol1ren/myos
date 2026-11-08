@@ -71,6 +71,7 @@ type Terminal struct {
 	curVis   bool
 	active   bool
 	closed   bool
+	dirty    bool
 	title    string
 	slaveDev string
 
@@ -178,14 +179,26 @@ func NewTerminal(rows, cols int) (*Terminal, error) {
 	return t, nil
 }
 
+// ShellWorker is an optional callback to start an internal in-process shell worker
+// attached to the slave PTY if fork/exec fails or is running in a test harness.
+var ShellWorker func(slave *os.File)
+
 func (t *Terminal) startProcess() {
 	self, err := os.Executable()
 	if err != nil || self == "" {
 		self = "/init"
 	}
 
-	// In unit test runner binary, don't re-exec the test harness
+	// In unit test runner binary, don't re-exec the test harness; use worker if available
 	if strings.HasSuffix(self, ".test") {
+		if ShellWorker != nil {
+			go func() {
+				ShellWorker(t.slave)
+				t.mu.Lock()
+				t.active = false
+				t.mu.Unlock()
+			}()
+		}
 		return
 	}
 
@@ -201,18 +214,34 @@ func (t *Terminal) startProcess() {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid:  true,
 		Setctty: true,
-		Ctty:    int(t.slave.Fd()),
+		Ctty:    0, // Child's stdin file descriptor index (0), NOT parent's slave.Fd()!
 	}
 
-	if err := cmd.Start(); err == nil {
-		t.cmd = cmd
-		go func() {
-			_ = cmd.Wait()
+	if err := cmd.Start(); err != nil {
+		_, _ = t.WriteString(fmt.Sprintf("\r\n[terminal] exec %s -shell: %v\r\n", self, err))
+		if ShellWorker != nil {
+			_, _ = t.WriteString("[terminal] starting internal shell worker...\r\n")
+			go func() {
+				ShellWorker(t.slave)
+				t.mu.Lock()
+				t.active = false
+				t.mu.Unlock()
+			}()
+		} else {
 			t.mu.Lock()
 			t.active = false
 			t.mu.Unlock()
-		}()
+		}
+		return
 	}
+
+	t.cmd = cmd
+	go func() {
+		_ = cmd.Wait()
+		t.mu.Lock()
+		t.active = false
+		t.mu.Unlock()
+	}()
 }
 
 func (t *Terminal) readLoop() {
@@ -232,19 +261,29 @@ func (t *Terminal) readLoop() {
 }
 
 // WriteInput sends keystrokes into the master PTY for the child process.
+// It releases t.mu before calling master.Write so it cannot block readLoop or Draw.
 func (t *Terminal) WriteInput(data []byte) (int, error) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.closed || t.master == nil {
+		t.mu.Unlock()
 		return 0, errors.New("terminal closed")
 	}
-	return t.master.Write(data)
+	master := t.master
+	t.mu.Unlock()
+
+	return master.Write(data)
+}
+
+// WriteString writes a string directly into the terminal display grid under mutex.
+func (t *Terminal) WriteString(s string) (int, error) {
+	return t.Write([]byte(s))
 }
 
 // Write parses ANSI escape sequences and writes printable characters into the grid buffer.
 func (t *Terminal) Write(p []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.dirty = true
 
 	for i := 0; i < len(p); i++ {
 		b := p[i]
@@ -446,6 +485,7 @@ func parseCSIArgs(params string) []int {
 func (t *Terminal) Draw(c *Canvas, winX, winY, winW, winH int, focused bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.dirty = false
 
 	// Window shadow
 	c.DrawFillRect(winX+5, winY+5, winW, winH, 0x060C1C)
@@ -515,6 +555,13 @@ func (t *Terminal) IsActive() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.active && !t.closed
+}
+
+// IsDirty reports whether the terminal grid has changed since the last Draw.
+func (t *Terminal) IsDirty() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.dirty
 }
 
 // Close terminates child process and releases PTY descriptors.

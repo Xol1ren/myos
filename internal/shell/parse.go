@@ -197,6 +197,10 @@ func parse(line string, lookup func(string) string) ([]stage, error) {
 
 func isStd(f *os.File) bool { return f == os.Stdin || f == os.Stdout || f == os.Stderr }
 
+func (s *Shell) isStd(f *os.File) bool {
+	return f == os.Stdin || f == os.Stdout || f == os.Stderr || f == s.in || f == s.out || f == s.err
+}
+
 // execute runs a parsed pipeline and returns the last stage's exit status.
 func (s *Shell) execute(stages []stage) int {
 	n := len(stages)
@@ -207,15 +211,18 @@ func (s *Shell) execute(stages []stage) int {
 		for _, f := range opened {
 			f.Close()
 		}
-		fmt.Fprintf(os.Stderr, "myos: %v\n", err)
+		fmt.Fprintf(s.errFile(), "myos: %v\n", err)
 		return 1
 	}
 
+	defaultIn := s.inFile()
+	defaultOut := s.outFile()
+
 	for i := range stages {
 		if ins[i] == nil {
-			ins[i] = os.Stdin
+			ins[i] = defaultIn
 		}
-		outs[i] = os.Stdout
+		outs[i] = defaultOut
 		if i < n-1 {
 			r, w, err := os.Pipe()
 			if err != nil {
@@ -257,10 +264,10 @@ func (s *Shell) execute(stages []stage) int {
 		go func(i int) {
 			code := s.runStage(stages[i], ins[i], outs[i])
 			// Close our ends so downstream readers see EOF.
-			if !isStd(ins[i]) {
+			if !s.isStd(ins[i]) {
 				ins[i].Close()
 			}
-			if !isStd(outs[i]) {
+			if !s.isStd(outs[i]) {
 				outs[i].Close()
 			}
 			codes <- [2]int{i, code}

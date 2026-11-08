@@ -2,7 +2,6 @@ package shell
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"syscall"
 	"unicode/utf8"
@@ -36,6 +35,8 @@ func makeRaw(fd int) (func(), error) {
 // readLine reads one line with editing and history. It returns io.EOF-like
 // os.ErrClosed semantics via the eof flag when Ctrl-D is pressed on an empty line.
 func (s *Shell) readLine(prompt string) (line string, eof bool) {
+	out := s.outFile()
+	inFd := int(s.inFile().Fd())
 	if !s.tty {
 		l, err := s.stdin.ReadString('\n')
 		if err != nil && l == "" {
@@ -43,7 +44,7 @@ func (s *Shell) readLine(prompt string) (line string, eof bool) {
 		}
 		return strings.TrimRight(l, "\r\n"), false
 	}
-	restore, err := makeRaw(0)
+	restore, err := makeRaw(inFd)
 	if err != nil {
 		l, err := s.stdin.ReadString('\n')
 		if err != nil && l == "" {
@@ -64,7 +65,7 @@ func (s *Shell) readLine(prompt string) (line string, eof bool) {
 		if col := utf8.RuneCountInString(prompt) + pos; col > 0 {
 			fmt.Fprintf(&sb, "\x1b[%dC", col)
 		}
-		_, _ = os.Stdout.WriteString(sb.String())
+		_, _ = out.WriteString(sb.String())
 	}
 	setLine := func(t string) {
 		buf = []rune(t)
@@ -79,14 +80,14 @@ func (s *Shell) readLine(prompt string) (line string, eof bool) {
 		}
 		switch r {
 		case '\r', '\n':
-			_, _ = os.Stdout.WriteString("\r\n")
+			_, _ = out.WriteString("\r\n")
 			return string(buf), false
 		case 3: // Ctrl-C
-			_, _ = os.Stdout.WriteString("^C\r\n")
+			_, _ = out.WriteString("^C\r\n")
 			return "", false
 		case 4: // Ctrl-D
 			if len(buf) == 0 {
-				_, _ = os.Stdout.WriteString("\r\n")
+				_, _ = out.WriteString("\r\n")
 				return "", true
 			}
 			if pos < len(buf) {
@@ -125,7 +126,7 @@ func (s *Shell) readLine(prompt string) (line string, eof bool) {
 			buf = append(buf[:i], buf[pos:]...)
 			pos = i
 		case 12: // Ctrl-L
-			_, _ = os.Stdout.WriteString("\x1b[H\x1b[2J")
+			_, _ = out.WriteString("\x1b[H\x1b[2J")
 		case 16, 14: // Ctrl-P / Ctrl-N
 			s.historyMove(&histIdx, &saved, &buf, &pos, r == 16, setLine)
 		case 27:

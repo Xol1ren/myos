@@ -1,7 +1,10 @@
 package fb
 
 import (
+	"os"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestTerminalGridAndANSI(t *testing.T) {
@@ -115,5 +118,104 @@ func TestOpenPTY(t *testing.T) {
 	msg := "hello pty\n"
 	if _, err := master.Write([]byte(msg)); err != nil {
 		t.Fatalf("write master: %v", err)
+	}
+}
+
+func TestTerminalInProcessShellWorker(t *testing.T) {
+	oldWorker := ShellWorker
+	defer func() { ShellWorker = oldWorker }()
+
+	ran := make(chan struct{})
+	ShellWorker = func(slave *os.File) {
+		_, _ = slave.WriteString("worker# \n")
+		close(ran)
+	}
+
+	term, err := NewTerminal(10, 40)
+	if err != nil {
+		t.Skipf("skipping NewTerminal on system without PTY: %v", err)
+		return
+	}
+	defer term.Close()
+
+	select {
+	case <-ran:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ShellWorker was not invoked")
+	}
+
+	// Give readLoop a moment to parse the output into grid
+	time.Sleep(50 * time.Millisecond)
+
+	if !term.IsDirty() {
+		t.Errorf("expected terminal to be dirty after worker output")
+	}
+
+	foundWorker := false
+	term.mu.Lock()
+	for r := 0; r < term.rows; r++ {
+		var row []byte
+		for c := 0; c < term.cols; c++ {
+			row = append(row, term.grid[r][c].Ch)
+		}
+		if strings.Contains(string(row), "worker#") {
+			foundWorker = true
+			break
+		}
+	}
+	term.mu.Unlock()
+
+	if !foundWorker {
+		t.Errorf("expected 'worker#' in terminal grid buffer")
+	}
+
+	// Draw resets dirty flag
+	c := NewCanvas(400, 300)
+	term.Draw(&c, 0, 0, 400, 300, true)
+	if term.IsDirty() {
+		t.Errorf("expected IsDirty to be false after Draw")
+	}
+}
+
+func TestTerminalWriteInputNonBlocking(t *testing.T) {
+	term, err := NewTerminal(10, 40)
+	if err != nil {
+		t.Skipf("skipping on system without PTY: %v", err)
+		return
+	}
+	defer term.Close()
+
+	// WriteInput should return promptly without deadlock
+	n, err := term.WriteInput([]byte("echo hi\r\n"))
+	if err != nil || n != 9 {
+		t.Fatalf("WriteInput failed: n=%d, err=%v", n, err)
+	}
+}
+
+func TestTerminalWriteString(t *testing.T) {
+	term := &Terminal{
+		rows:   5,
+		cols:   20,
+		curVis: true,
+		curFg:  termDefaultFg,
+		curBg:  termDefaultBg,
+		csiBuf: make([]byte, 0, 32),
+		title:  "Mini Term",
+	}
+	term.grid = make([][]Cell, 5)
+	for r := 0; r < 5; r++ {
+		term.grid[r] = make([]Cell, 20)
+		for c := 0; c < 20; c++ {
+			term.grid[r][c] = Cell{Ch: ' ', Fg: termDefaultFg, Bg: termDefaultBg}
+		}
+	}
+
+	_, _ = term.WriteString("DirectString\n")
+	var row []byte
+	for c := 0; c < 20; c++ {
+		row = append(row, term.grid[0][c].Ch)
+	}
+	if !strings.Contains(string(row), "DirectString") {
+		t.Errorf("expected DirectString in row 0, got %q", string(row))
 	}
 }
