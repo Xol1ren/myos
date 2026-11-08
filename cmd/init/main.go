@@ -68,7 +68,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	mouse := input.New("/dev/input/mice", 1024, 768)
+	mouse := input.New("/dev/input/mice", 1280, 800)
 	go mouse.Run(ctx)
 
 	if pid1 {

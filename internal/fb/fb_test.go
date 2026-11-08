@@ -1,6 +1,7 @@
 package fb
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -342,5 +343,180 @@ func TestBlitPerformance(t *testing.T) {
 
 	if avgBlit > 10*time.Millisecond {
 		t.Fatalf("Blit is too slow: %v per frame (target < 5ms for 60 FPS)", avgBlit)
+	}
+}
+
+func TestCursorBoundaryClippingAndEdges(t *testing.T) {
+	c := NewCanvas(1280, 800)
+	for i := range c.Pix {
+		c.Pix[i] = 0x123456
+	}
+	orig := append([]uint32(nil), c.Pix...)
+
+	cu := NewCursor()
+	edgePositions := [][2]int{
+		{0, 0},
+		{-5, -5},
+		{-curW, 0},
+		{0, -curH},
+		{1280 - curW, 800 - curH},
+		{1280 - 1, 800 - 1},
+		{1280 - 5, 800 - 5},
+		{1280, 800},
+		{1300, 850},
+		{-20, 400},
+		{1280 + 10, 400},
+		{640, -15},
+		{640, 800 + 10},
+	}
+
+	for _, pos := range edgePositions {
+		// Draw and ensure no panics
+		cu.Draw(&c, pos[0], pos[1])
+		// Restore and ensure exact pixel restoration
+		cu.Restore(&c)
+		for i := range c.Pix {
+			if c.Pix[i] != orig[i] {
+				t.Fatalf("pixel %d modified after Restore at position %v", i, pos)
+			}
+		}
+	}
+
+	// Test DrawCursor and RestoreCursor on Canvas
+	c.DrawCursor(cu, 1275, 795)
+	c.RestoreCursor(cu)
+	for i := range c.Pix {
+		if c.Pix[i] != orig[i] {
+			t.Fatalf("pixel %d modified after Canvas.RestoreCursor", i)
+		}
+	}
+}
+
+func TestCursorNilAndCanvasSafety(t *testing.T) {
+	var nilCu *Cursor
+	var nilCanvas *Canvas
+	emptyCanvas := &Canvas{}
+
+	// None of these should panic
+	nilCu.Draw(nilCanvas, 10, 10)
+	nilCu.Restore(nilCanvas)
+	nilCanvas.DrawCursor(nilCu, 10, 10)
+	nilCanvas.RestoreCursor(nilCu)
+	nilCanvas.DrawPixel(5, 5, 0xFF)
+	nilCanvas.DrawFillRect(0, 0, 10, 10, 0xFF)
+	nilCanvas.DrawGlyph(0, 0, 'A', 0xFF)
+
+	cu := NewCursor()
+	cu.Draw(nilCanvas, 0, 0)
+	cu.Restore(nilCanvas)
+	cu.Draw(emptyCanvas, 0, 0)
+	cu.Restore(emptyCanvas)
+}
+
+func TestDesktopExitButtonHitTest(t *testing.T) {
+	d := NewDesktop(1280, 800)
+	ex, ey, ew, eh := d.ExitButtonRect(1280)
+	if ex != 1280-68 || ey != 2 || ew != 60 || eh != 20 {
+		t.Fatalf("unexpected exit button rect: got (%d, %d, %d, %d), want (1212, 2, 60, 20)", ex, ey, ew, eh)
+	}
+
+	// Click outside button
+	st := input.State{X: 100, Y: 10, W: 1280, H: 800, Buttons: input.Left}
+	d.Update(st)
+	if d.shouldQuit {
+		t.Fatal("desktop should not quit when clicking outside [Exit]")
+	}
+
+	// Release
+	st.Buttons = 0
+	d.Update(st)
+
+	// Click inside [Exit] button at top-left edge
+	st.X, st.Y, st.Buttons = ex, ey, input.Left
+	d.Update(st)
+	if !d.shouldQuit {
+		t.Fatal("desktop should quit when clicking top-left of [Exit] button")
+	}
+
+	// Reset and click inside [Exit] button at bottom-right edge
+	d.shouldQuit = false
+	st.Buttons = 0
+	d.Update(st)
+	st.X, st.Y, st.Buttons = ex+ew-1, ey+eh-1, input.Left
+	d.Update(st)
+	if !d.shouldQuit {
+		t.Fatal("desktop should quit when clicking bottom-right of [Exit] button")
+	}
+}
+
+func TestKeyboardListenerMultiplexing(t *testing.T) {
+	p1r, p1w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p1r.Close()
+	defer p1w.Close()
+
+	p2r, p2w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p2r.Close()
+	defer p2w.Close()
+
+	l := &KeyboardListener{
+		primaryFd: int(p1r.Fd()),
+		ttyFd:     int(p2r.Fd()),
+	}
+	defer l.Close()
+
+	// Write to primary (serial/host stdin)
+	if _, err := p1w.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	buf, ok, eof := l.Poll(50 * time.Millisecond)
+	if !ok || eof || string(buf) != "hello" {
+		t.Fatalf("primary poll failed: got ok=%v, eof=%v, buf=%q", ok, eof, string(buf))
+	}
+
+	// Write to secondary (/dev/tty0 QEMU console focus)
+	if _, err := p2w.Write([]byte{0x1b, '[', 'A'}); err != nil {
+		t.Fatal(err)
+	}
+	buf, ok, eof = l.Poll(50 * time.Millisecond)
+	if !ok || eof || len(buf) != 3 || string(buf) != "\x1b[A" {
+		t.Fatalf("secondary poll failed: got ok=%v, eof=%v, buf=%v", ok, eof, buf)
+	}
+}
+
+func TestRouteInputTerminalRouting(t *testing.T) {
+	d := NewDesktop(1280, 800)
+	if d.Term == nil {
+		t.Skip("skipping terminal test on platform without PTY support")
+	}
+
+	// Test routing control keys & runes
+	d.focusWin = 1
+	quit := d.RouteInput([]byte("echo hi\r\n"))
+	if quit {
+		t.Fatal("RouteInput should not quit for standard input")
+	}
+
+	// Test Backspace
+	quit = d.RouteInput([]byte{0x7F, 0x08})
+	if quit {
+		t.Fatal("RouteInput should not quit on backspace")
+	}
+
+	// Test Arrow keys escape sequence
+	quit = d.RouteInput([]byte{0x1b, '[', 'A'})
+	if quit {
+		t.Fatal("RouteInput should not quit on arrow escape sequence")
+	}
+
+	// Test Ctrl-Q exits
+	quit = d.RouteInput([]byte{0x11})
+	if !quit || !d.shouldQuit {
+		t.Fatal("RouteInput should quit on Ctrl-Q (0x11)")
 	}
 }

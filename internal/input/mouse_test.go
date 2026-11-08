@@ -159,3 +159,25 @@ func TestRunRetriesMissingDeviceAndStops(t *testing.T) {
 		t.Fatal("Run ignored cancellation while retrying")
 	}
 }
+
+func TestMouseBounds1280x800(t *testing.T) {
+	m := New("/nonexistent", 1280, 800)
+	if s := m.Snapshot(); s.W != 1280 || s.H != 800 || s.X != 640 || s.Y != 400 {
+		t.Fatalf("initial 1280x800 state wrong: %+v", s)
+	}
+
+	m.apply(2000, 2000, 0)
+	if s := m.Snapshot(); s.X != 1279 || s.Y != 799 {
+		t.Fatalf("clamp at 1280x800 max: got (%d, %d), want (1279, 799)", s.X, s.Y)
+	}
+
+	// Dynamic update
+	m.SetBounds(1920, 1080)
+	if s := m.Snapshot(); s.W != 1920 || s.H != 1080 {
+		t.Fatalf("dynamic SetBounds failed: %+v", s)
+	}
+
+	// Nil safety
+	var nilMouse *Mouse
+	nilMouse.SetBounds(1280, 800)
+}

@@ -517,18 +517,39 @@ func biGui(s *Shell, io *IO, a []string) int {
 		restoreTTY()
 		fmt.Fprint(os.Stdout, "\x1b[2J\x1b[H")
 	}()
+
+	// Dual Keyboard Listener: multiplexes os.Stdin and /dev/tty0
+	klist, _ := fb.OpenDualKeyboard()
+	if klist != nil {
+		defer klist.Close()
+	}
+
 	desk := fb.NewDesktop(dev.Width(), dev.Height())
 	guiWait := func(d time.Duration) bool {
 		deadline := time.Now().Add(d)
 		for {
-			k, ok, eof := pollKey(time.Until(deadline))
+			rem := time.Until(deadline)
+			if rem <= 0 {
+				return false
+			}
+			var data []byte
+			var ok, eof bool
+			if klist != nil {
+				data, ok, eof = klist.Poll(rem)
+			} else {
+				var k byte
+				k, ok, eof = pollKey(rem)
+				if ok {
+					data = []byte{k}
+				}
+			}
 			if eof {
 				return true
 			}
 			if !ok {
 				return false
 			}
-			if desk.RouteKey(k) {
+			if desk.RouteInput(data) {
 				return true
 			}
 		}

@@ -15,20 +15,34 @@ func NewCanvas(w, h int) Canvas { return Canvas{Pix: make([]uint32, w*h), W: w, 
 
 // DrawPixel sets one pixel (ignored when out of bounds).
 func (c *Canvas) DrawPixel(x, y int, col Color) {
+	if c == nil || len(c.Pix) == 0 || c.W <= 0 || c.H <= 0 {
+		return
+	}
 	if x < 0 || y < 0 || x >= c.W || y >= c.H {
 		return
 	}
-	c.Pix[y*c.W+x] = col
+	idx := y*c.W + x
+	if idx >= 0 && idx < len(c.Pix) {
+		c.Pix[idx] = col
+	}
 }
 
 // DrawFillRect fills a w*h rectangle at (x,y).
 func (c *Canvas) DrawFillRect(x, y, w, h int, col Color) {
+	if c == nil || len(c.Pix) == 0 || c.W <= 0 || c.H <= 0 {
+		return
+	}
 	x0, y0, x1, y1 := max(x, 0), max(y, 0), min(x+w, c.W), min(y+h, c.H)
 	if x0 >= x1 || y0 >= y1 {
 		return
 	}
 	for yy := y0; yy < y1; yy++ {
-		row := c.Pix[yy*c.W+x0 : yy*c.W+x1]
+		start := yy*c.W + x0
+		end := yy*c.W + x1
+		if start < 0 || end > len(c.Pix) || start >= end {
+			continue
+		}
+		row := c.Pix[start:end]
 		for i := range row {
 			row[i] = col
 		}
@@ -54,6 +68,9 @@ const (
 
 // DrawGlyph draws one ASCII character; unknown characters render as '?'.
 func (c *Canvas) DrawGlyph(x, y int, ch byte, col Color) {
+	if c == nil || len(c.Pix) == 0 || c.W <= 0 || c.H <= 0 {
+		return
+	}
 	if ch < 32 || ch > 126 {
 		ch = '?'
 	}
@@ -88,4 +105,18 @@ func (c *Canvas) DrawBytes(x, y int, s []byte, col Color) int {
 		x += GlyphW
 	}
 	return x
+}
+
+// DrawCursor renders the cursor on the canvas with strict boundary clipping.
+func (c *Canvas) DrawCursor(cu *Cursor, x, y int) {
+	if cu != nil {
+		cu.Draw(c, x, y)
+	}
+}
+
+// RestoreCursor restores the background pixels covered by the cursor.
+func (c *Canvas) RestoreCursor(cu *Cursor) {
+	if cu != nil {
+		cu.Restore(c)
+	}
 }

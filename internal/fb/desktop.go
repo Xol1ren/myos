@@ -53,6 +53,8 @@ type Desktop struct {
 	TermWin Window // Terminal window
 	Term    *Terminal
 
+	width       int
+	height      int
 	focusWin    int // 0: Win (Sysmon), 1: TermWin (Terminal)
 	draggingWin int // -1: none, 0: Win, 1: TermWin
 	dragDX      int
@@ -107,6 +109,8 @@ func NewDesktop(w, h int) *Desktop {
 	d := &Desktop{
 		Win:         Window{X: sysX, Y: sysY, W: sysW, H: sysH, Title: "System Monitor"},
 		TermWin:     Window{X: termX, Y: termY, W: termW, H: termH, Title: "Terminal"},
+		width:       w,
+		height:      h,
 		focusWin:    1, // Default focus to terminal
 		draggingWin: -1,
 		fpsStamp:    time.Now(),
@@ -129,30 +133,52 @@ func (d *Desktop) buttonRect() (x, y, w, h int) {
 }
 
 func (d *Desktop) exitButtonRect(screenW int) (x, y, w, h int) {
+	if screenW <= 0 {
+		screenW = d.width
+	}
+	if screenW <= 0 {
+		screenW = 1280
+	}
 	return screenW - 68, 2, 60, 20
+}
+
+// ExitButtonRect returns the topbar [Exit] button rectangle for a given screen width.
+func (d *Desktop) ExitButtonRect(screenW int) (x, y, w, h int) {
+	return d.exitButtonRect(screenW)
 }
 
 func inside(px, py, x, y, w, h int) bool { return px >= x && py >= y && px < x+w && py < y+h }
 
-// RouteKey routes keyboard input from the GUI loop to the terminal or handles quit shortcuts.
-func (d *Desktop) RouteKey(k byte) bool {
-	if k == 0x11 { // Ctrl-Q exits desktop
-		d.shouldQuit = true
-		return true
+// RouteInput routes keyboard bytes to the terminal or handles quit shortcuts.
+// Keystrokes are forwarded directly to Terminal.WriteInput, supporting printable
+// runes, control keys, Backspace (0x7F / 0x08), Enter (0x0D / 0x0A), and arrow escape sequences.
+func (d *Desktop) RouteInput(data []byte) bool {
+	for _, b := range data {
+		if b == 0x11 { // Ctrl-Q exits desktop
+			d.shouldQuit = true
+			return true
+		}
 	}
 	if d.Term != nil && d.Term.IsActive() && d.focusWin == 1 {
-		_, _ = d.Term.WriteInput([]byte{k})
+		_, _ = d.Term.WriteInput(data)
 		return false
 	}
 	// Fallback when terminal not focused or not active
-	if k == 'q' || k == 'Q' || k == 27 || k == 3 {
-		d.shouldQuit = true
-		return true
+	for _, b := range data {
+		if b == 'q' || b == 'Q' || b == 27 || b == 3 {
+			d.shouldQuit = true
+			return true
+		}
 	}
 	if d.Term != nil && d.Term.IsActive() {
-		_, _ = d.Term.WriteInput([]byte{k})
+		_, _ = d.Term.WriteInput(data)
 	}
 	return false
+}
+
+// RouteKey routes keyboard input from the GUI loop to the terminal or handles quit shortcuts.
+func (d *Desktop) RouteKey(k byte) bool {
+	return d.RouteInput([]byte{k})
 }
 
 // Update handles mouse interaction (window dragging, button clicks, focus) for one frame.
@@ -160,11 +186,17 @@ func (d *Desktop) Update(st input.State) {
 	pressed := st.Buttons&input.Left != 0 && d.prevBtn&input.Left == 0
 	released := st.Buttons&input.Left == 0
 
+	sw := st.W
+	if sw <= 0 || (d.width > 0 && sw != d.width) {
+		sw = d.width
+	}
+
 	if pressed {
 		// 1. Check Topbar Exit Button
-		ex, ey, ew, eh := d.exitButtonRect(st.W)
+		ex, ey, ew, eh := d.exitButtonRect(sw)
 		if inside(st.X, st.Y, ex, ey, ew, eh) {
 			d.shouldQuit = true
+			return
 		}
 
 		// 2. Check Terminal Window
@@ -203,11 +235,11 @@ func (d *Desktop) Update(st input.State) {
 	// Update window positions during drag
 	if d.draggingWin == 0 {
 		w := &d.Win
-		w.X = min(max(st.X-d.dragDX, 0), max(st.W-w.W, 0))
+		w.X = min(max(st.X-d.dragDX, 0), max(sw-w.W, 0))
 		w.Y = min(max(st.Y-d.dragDY, topBarH), max(st.H-w.H, topBarH))
 	} else if d.draggingWin == 1 {
 		tw := &d.TermWin
-		tw.X = min(max(st.X-d.dragDX, 0), max(st.W-tw.W, 0))
+		tw.X = min(max(st.X-d.dragDX, 0), max(sw-tw.W, 0))
 		tw.Y = min(max(st.Y-d.dragDY, topBarH), max(st.H-tw.H, topBarH))
 	}
 
@@ -269,6 +301,9 @@ func primaryIP() string {
 
 // Draw renders the whole desktop scene into c.
 func (d *Desktop) Draw(c *Canvas, st input.State, backend ...string) {
+	if c != nil && c.W > 0 && c.H > 0 {
+		d.width, d.height = c.W, c.H
+	}
 	c.DrawFillRect(0, 0, c.W, c.H, colBackground)
 
 	// Top bar: title on the left, clock centred, memory/IP on the right, exit button.
@@ -411,6 +446,36 @@ func (d *Desktop) Run(dev Device, m *input.Mouse, wait func(time.Duration) bool)
 		}
 	}()
 
+	if wait == nil {
+		klist, _ := OpenDualKeyboard()
+		if klist != nil {
+			defer klist.Close()
+		}
+		wait = func(dur time.Duration) bool {
+			deadline := time.Now().Add(dur)
+			for {
+				rem := time.Until(deadline)
+				if rem <= 0 {
+					return false
+				}
+				var data []byte
+				var ok, eof bool
+				if klist != nil {
+					data, ok, eof = klist.Poll(rem)
+				}
+				if eof {
+					return true
+				}
+				if !ok {
+					return false
+				}
+				if d.RouteInput(data) {
+					return true
+				}
+			}
+		}
+	}
+
 	prev := m.Snapshot()
 	m.SetBounds(dev.Width(), dev.Height())
 	defer m.SetBounds(prev.W, prev.H)
@@ -425,6 +490,9 @@ func (d *Desktop) Run(dev Device, m *input.Mouse, wait func(time.Duration) bool)
 		}
 		st := m.Snapshot()
 		d.Update(st)
+		if d.shouldQuit {
+			return
+		}
 		d.Draw(c, st, dev.Backend())
 		cur.Draw(c, st.X, st.Y)
 		dev.Blit()

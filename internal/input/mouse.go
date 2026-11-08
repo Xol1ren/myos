@@ -55,8 +55,11 @@ func New(path string, width, height int) *Mouse {
 	return m
 }
 
-// SetBounds changes the clamping rectangle.
+// SetBounds changes the clamping rectangle dynamically to the target display resolution.
 func (m *Mouse) SetBounds(width, height int) {
+	if m == nil {
+		return
+	}
 	if width < 1 {
 		width = 1
 	}

@@ -282,3 +282,39 @@ func TestPollKeyTimeout(t *testing.T) {
 		t.Fatalf("expected eof, got k=%d ok=%v eof=%v", k, ok, eof)
 	}
 }
+
+func TestPollDualBytes(t *testing.T) {
+	r1, w1, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r1.Close()
+	defer w1.Close()
+
+	r2, w2, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Close()
+	defer w2.Close()
+
+	// 1. Timeout
+	buf, ok, eof := pollDualBytes(int(r1.Fd()), int(r2.Fd()), 30*time.Millisecond)
+	if ok || eof || len(buf) > 0 {
+		t.Fatalf("expected timeout, got ok=%v, eof=%v, buf=%v", ok, eof, buf)
+	}
+
+	// 2. Data from fd1
+	_, _ = w1.Write([]byte("input1"))
+	buf, ok, eof = pollDualBytes(int(r1.Fd()), int(r2.Fd()), 30*time.Millisecond)
+	if !ok || eof || string(buf) != "input1" {
+		t.Fatalf("expected 'input1', got ok=%v, eof=%v, buf=%q", ok, eof, string(buf))
+	}
+
+	// 3. Data from fd2
+	_, _ = w2.Write([]byte("input2"))
+	buf, ok, eof = pollDualBytes(int(r1.Fd()), int(r2.Fd()), 30*time.Millisecond)
+	if !ok || eof || string(buf) != "input2" {
+		t.Fatalf("expected 'input2', got ok=%v, eof=%v, buf=%q", ok, eof, string(buf))
+	}
+}
