@@ -61,7 +61,7 @@ func ParseMounts(mountsPath string) (map[string]MountEntry, error) {
 // FormatBytes formats a byte count into a human-readable string (e.g. 512.0M, 10.0G).
 func FormatBytes(b uint64) string {
 	const (
-		_   = 1 << (10 * iota)
+		_ = 1 << (10 * iota)
 		kib
 		mib
 		gib

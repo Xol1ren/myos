@@ -639,4 +639,3 @@ func biFetch(_ *Shell, io *IO, args []string) int {
 		res.BytesRead, res.Duration.Round(time.Millisecond), sys.FormatBytes(uint64(rate)), dest, res.StatusCode, res.StatusText)
 	return 0
 }
-

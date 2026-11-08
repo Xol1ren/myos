@@ -208,12 +208,12 @@ type mockDevice struct {
 	closed bool
 }
 
-func (m *mockDevice) Width() int           { return m.Canvas.W }
-func (m *mockDevice) Height() int          { return m.Canvas.H }
-func (m *mockDevice) Surface() *Canvas     { return &m.Canvas }
-func (m *mockDevice) Blit()                { m.blits++ }
-func (m *mockDevice) Close() error         { m.closed = true; return nil }
-func (m *mockDevice) Backend() string      { return "MockDevice (100x100)" }
+func (m *mockDevice) Width() int       { return m.Canvas.W }
+func (m *mockDevice) Height() int      { return m.Canvas.H }
+func (m *mockDevice) Surface() *Canvas { return &m.Canvas }
+func (m *mockDevice) Blit()            { m.blits++ }
+func (m *mockDevice) Close() error     { m.closed = true; return nil }
+func (m *mockDevice) Backend() string  { return "MockDevice (100x100)" }
 
 func TestDeviceInterface(t *testing.T) {
 	// Ensure *Framebuffer and *DRMDevice implement Device
