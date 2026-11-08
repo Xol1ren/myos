@@ -520,3 +520,72 @@ func TestRouteInputTerminalRouting(t *testing.T) {
 		t.Fatal("RouteInput should quit on Ctrl-Q (0x11)")
 	}
 }
+
+func TestHideCursor(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	restore := HideCursor(int(w.Fd()))
+	var buf [16]byte
+	n, err := r.Read(buf[:])
+	if err != nil || string(buf[:n]) != "\x1b[?25l" {
+		t.Fatalf("expected \\x1b[?25l, got n=%d, err=%v, buf=%q", n, err, string(buf[:n]))
+	}
+
+	restore()
+	n, err = r.Read(buf[:])
+	if err != nil || string(buf[:n]) != "\x1b[?25h" {
+		t.Fatalf("expected \\x1b[?25h, got n=%d, err=%v, buf=%q", n, err, string(buf[:n]))
+	}
+
+	// Also verify GraphicsMode behaves identically without KD_GRAPHICS
+	restore = GraphicsMode(int(w.Fd()))
+	n, err = r.Read(buf[:])
+	if err != nil || string(buf[:n]) != "\x1b[?25l" {
+		t.Fatalf("expected \\x1b[?25l from GraphicsMode, got %q", string(buf[:n]))
+	}
+	restore()
+	n, err = r.Read(buf[:])
+	if err != nil || string(buf[:n]) != "\x1b[?25h" {
+		t.Fatalf("expected \\x1b[?25h from GraphicsMode restore, got %q", string(buf[:n]))
+	}
+}
+
+func TestKeyboardListenerPollTimeoutAndDrain(t *testing.T) {
+	p1r, p1w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p1r.Close()
+	defer p1w.Close()
+
+	l, err := NewKeyboardListener(int(p1r.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	// Timeout test
+	buf, ok, eof := l.Poll(10 * time.Millisecond)
+	if ok || eof || len(buf) > 0 {
+		t.Fatalf("expected timeout: ok=%v eof=%v buf=%v", ok, eof, buf)
+	}
+
+	// Burst drain test
+	_, _ = p1w.Write([]byte("abcdef"))
+	buf, ok, eof = l.Poll(50 * time.Millisecond)
+	if !ok || eof || string(buf) != "abcdef" {
+		t.Fatalf("expected drained buffer 'abcdef', got %q (ok=%v, eof=%v)", string(buf), ok, eof)
+	}
+
+	// Close test
+	_ = l.Close()
+	buf, ok, eof = l.Poll(10 * time.Millisecond)
+	if !eof {
+		t.Fatalf("expected eof=true on closed listener, got ok=%v, eof=%v, buf=%v", ok, eof, buf)
+	}
+}

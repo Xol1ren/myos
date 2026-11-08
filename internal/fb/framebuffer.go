@@ -14,9 +14,6 @@ import (
 const (
 	fbioGetVScreenInfo = 0x4600
 	fbioGetFScreenInfo = 0x4602
-	kdSetMode          = 0x4B3A
-	kdText             = 0x00
-	kdGraphics         = 0x01
 )
 
 type bitfield struct{ offset, length, msbRight uint32 }
@@ -202,12 +199,22 @@ func (b *Framebuffer) Close() error {
 	return err
 }
 
-// GraphicsMode switches the virtual terminal on fd to KD_GRAPHICS so the
-// kernel console stops drawing over the GUI. The returned function restores
-// KD_TEXT. If fd is not a VT (e.g. a serial console) it is a no-op.
-func GraphicsMode(fd int) (restore func()) {
-	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), kdSetMode, kdGraphics); e != 0 {
+// HideCursor hides the blinking hardware VT cursor on fd via ANSI escape
+// sequence \033[?25l and returns a restore function that writes \033[?25h on exit.
+// It avoids calling KD_GRAPHICS, preserving kernel keyboard scancode translation.
+func HideCursor(fd int) (restore func()) {
+	if fd < 0 {
 		return func() {}
 	}
-	return func() { syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), kdSetMode, kdText) }
+	_, _ = syscall.Write(fd, []byte("\x1b[?25l"))
+	return func() {
+		_, _ = syscall.Write(fd, []byte("\x1b[?25h"))
+	}
+}
+
+// GraphicsMode is deprecated and kept for compatibility. It now delegates to
+// HideCursor, keeping the Virtual Console in KD_TEXT mode so scancode translation
+// remains active.
+func GraphicsMode(fd int) (restore func()) {
+	return HideCursor(fd)
 }

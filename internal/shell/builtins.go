@@ -509,11 +509,11 @@ func biGui(s *Shell, io *IO, a []string) int {
 		fmt.Fprintln(io.Err, "gui:", err)
 		return 1
 	}
-	restoreVT := fb.GraphicsMode(0)
-	// Deferred in this order: close the GUI, back to text mode, cooked tty,
+	restoreCursor := fb.HideCursor(0)
+	// Deferred in this order: close the GUI, restore hardware cursor, cooked tty,
 	// then repaint a clean console.
 	defer func() {
-		restoreVT()
+		restoreCursor()
 		restoreTTY()
 		fmt.Fprint(os.Stdout, "\x1b[2J\x1b[H")
 	}()

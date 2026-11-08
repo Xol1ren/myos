@@ -11,67 +11,153 @@ import (
 )
 
 // KeyboardListener multiplexes keyboard input from both the primary console
-// (typically os.Stdin / serial console) and a secondary VT console (/dev/tty0
-// for QEMU graphical window focus).
+// (typically os.Stdin / serial console) and secondary virtual terminals
+// (/dev/tty0, /dev/tty1 for QEMU graphical window focus).
+// Dedicated reader goroutines block on read() and push incoming bytes to keyChan.
 type KeyboardListener struct {
-	mu         sync.Mutex
-	primaryFd  int
-	ttyFd      int
-	restoreTTY func()
-	restoreVT  func()
-	closed     bool
+	mu        sync.Mutex
+	primaryFd int
+	ttyFd     int
+	files     []*os.File
+	restores  []func()
+	keyChan   chan byte
+	done      chan struct{}
+	closed    bool
 }
 
-// OpenDualKeyboard opens /dev/tty0 (or configured secondary console) alongside os.Stdin (fd 0).
+// OpenDualKeyboard opens /dev/tty0 and /dev/tty1 (if available) alongside os.Stdin (fd 0).
 func OpenDualKeyboard() (*KeyboardListener, error) {
-	return NewKeyboardListener(int(os.Stdin.Fd()), "/dev/tty0")
+	return NewKeyboardListener(int(os.Stdin.Fd()), "/dev/tty0", "/dev/tty1")
 }
 
-// NewKeyboardListener initializes multiplexed keyboard input on primaryFd and secondaryPath.
-// If secondaryPath cannot be opened or refers to the same device as primaryFd,
-// it falls back to listening solely on primaryFd.
-func NewKeyboardListener(primaryFd int, secondaryPath string) (*KeyboardListener, error) {
+// NewKeyboardListener initializes multiplexed keyboard input on primaryFd and secondaryPaths.
+// It configures raw termios without echo, hides the hardware cursor via ANSI escape sequences,
+// and spawns dedicated reader goroutines feeding into a buffered byte channel.
+func NewKeyboardListener(primaryFd int, secondaryPaths ...string) (*KeyboardListener, error) {
 	l := &KeyboardListener{
 		primaryFd: primaryFd,
 		ttyFd:     -1,
+		keyChan:   make(chan byte, 512),
+		done:      make(chan struct{}),
 	}
 
-	// Ensure primary descriptor is in non-blocking mode so Read never hangs the GUI
+	seenDevs := make(map[uint64]bool)
+
+	// Primary console (typically serial or os.Stdin)
 	if primaryFd >= 0 {
-		_ = syscall.SetNonblock(primaryFd, true)
+		var st syscall.Stat_t
+		if err := syscall.Fstat(primaryFd, &st); err == nil && st.Rdev != 0 {
+			seenDevs[st.Rdev] = true
+		}
+		if r := setRawMode(primaryFd); r != nil {
+			l.restores = append(l.restores, r)
+		}
+		if r := hideCursor(primaryFd); r != nil {
+			l.restores = append(l.restores, r)
+		}
+		var primFile *os.File
+		if primaryFd == int(os.Stdin.Fd()) {
+			primFile = os.Stdin
+		} else {
+			primFile = os.NewFile(uintptr(primaryFd), "primary")
+		}
+		l.startReader(primFile, true)
 	}
 
-	if secondaryPath != "" {
-		// Open secondary console in non-blocking mode
-		fd, err := syscall.Open(secondaryPath, syscall.O_RDWR|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	// Secondary consoles (/dev/tty0, /dev/tty1)
+	for _, path := range secondaryPaths {
+		if path == "" {
+			continue
+		}
+		f, err := os.OpenFile(path, os.O_RDWR|syscall.O_CLOEXEC, 0)
 		if err != nil {
-			fd, err = syscall.Open(secondaryPath, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+			f, err = os.OpenFile(path, os.O_RDONLY|syscall.O_CLOEXEC, 0)
 		}
-		if err == nil && fd >= 0 {
-			// Check if primary and secondary are the exact same device
-			var stPrim, stSec syscall.Stat_t
-			sameDevice := false
-			if syscall.Fstat(primaryFd, &stPrim) == nil && syscall.Fstat(fd, &stSec) == nil {
-				if stPrim.Rdev != 0 && stPrim.Rdev == stSec.Rdev {
-					sameDevice = true
-				}
-			}
-			if sameDevice {
-				_ = syscall.Close(fd)
-			} else {
-				l.ttyFd = fd
-				// Configure raw mode and graphics mode on secondary console
-				l.restoreTTY = setRawMode(fd)
-				l.restoreVT = GraphicsMode(fd)
-			}
+		if err != nil {
+			continue
 		}
+		fd := int(f.Fd())
+		var st syscall.Stat_t
+		if err := syscall.Fstat(fd, &st); err == nil && st.Rdev != 0 {
+			if seenDevs[st.Rdev] {
+				// Duplicate of primary or previously opened device
+				_ = f.Close()
+				continue
+			}
+			seenDevs[st.Rdev] = true
+		}
+
+		if l.ttyFd < 0 {
+			l.ttyFd = fd
+		}
+		if r := setRawMode(fd); r != nil {
+			l.restores = append(l.restores, r)
+		}
+		if r := hideCursor(fd); r != nil {
+			l.restores = append(l.restores, r)
+		}
+		l.files = append(l.files, f)
+		l.startReader(f, false)
 	}
 
 	return l, nil
 }
 
+func (l *KeyboardListener) ensureInit() {
+	if l.keyChan == nil {
+		l.keyChan = make(chan byte, 512)
+		l.done = make(chan struct{})
+		if l.primaryFd >= 0 {
+			var f *os.File
+			if l.primaryFd == int(os.Stdin.Fd()) {
+				f = os.Stdin
+			} else {
+				f = os.NewFile(uintptr(l.primaryFd), "primary")
+			}
+			l.startReader(f, true)
+		}
+		if l.ttyFd >= 0 {
+			f := os.NewFile(uintptr(l.ttyFd), "secondary")
+			l.startReader(f, false)
+		}
+	}
+}
+
+func (l *KeyboardListener) startReader(f *os.File, isPrimary bool) {
+	if f == nil {
+		return
+	}
+	go func() {
+		buf := make([]byte, 128)
+		for {
+			n, err := f.Read(buf)
+			if n > 0 {
+				for i := 0; i < n; i++ {
+					select {
+					case <-l.done:
+						return
+					case l.keyChan <- buf[i]:
+					}
+				}
+			}
+			if err != nil {
+				return
+			}
+			select {
+			case <-l.done:
+				return
+			default:
+			}
+		}
+	}()
+}
+
 // setRawMode puts fd into raw mode for character-at-a-time input without echo.
+// It disables ICANON, ECHO, ISIG, IEXTEN, and ICRNL, with VMIN=1, VTIME=0.
 func setRawMode(fd int) func() {
+	if fd < 0 {
+		return nil
+	}
 	var old syscall.Termios
 	if err := sys.Ioctl(fd, syscall.TCGETS, unsafe.Pointer(&old)); err != nil {
 		return nil
@@ -88,95 +174,109 @@ func setRawMode(fd int) func() {
 	}
 }
 
-// Poll waits up to timeout d for input from either input source using select.
+// hideCursor writes ANSI \033[?25l to hide the blinking hardware cursor on fd
+// and returns a restore function that writes \033[?25h.
+func hideCursor(fd int) func() {
+	if fd < 0 {
+		return nil
+	}
+	_, _ = syscall.Write(fd, []byte("\x1b[?25l"))
+	return func() {
+		_, _ = syscall.Write(fd, []byte("\x1b[?25h"))
+	}
+}
+
+// Poll waits up to timeout d for input from any monitored console.
 // Returns read bytes, ok=true if data arrived, eof=true on EOF or unrecoverable error.
 func (l *KeyboardListener) Poll(d time.Duration) (buf []byte, ok, eof bool) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.ensureInit()
 	if l.closed {
+		l.mu.Unlock()
 		return nil, false, true
 	}
-	if d < 0 {
-		d = 0
-	}
+	done := l.done
+	keyChan := l.keyChan
+	l.mu.Unlock()
 
-	var fds syscall.FdSet
-	maxFd := -1
-	if l.primaryFd >= 0 && l.primaryFd < 1024 {
-		fds.Bits[l.primaryFd/64] |= 1 << (uint(l.primaryFd) % 64)
-		if l.primaryFd > maxFd {
-			maxFd = l.primaryFd
-		}
-	}
-	if l.ttyFd >= 0 && l.ttyFd < 1024 {
-		fds.Bits[l.ttyFd/64] |= 1 << (uint(l.ttyFd) % 64)
-		if l.ttyFd > maxFd {
-			maxFd = l.ttyFd
-		}
-	}
-	if maxFd < 0 {
-		return nil, false, true
-	}
-
-	tv := syscall.NsecToTimeval(d.Nanoseconds())
-	n, err := syscall.Select(maxFd+1, &fds, nil, nil, &tv)
-	if err != nil || n <= 0 {
-		return nil, false, false // timeout or EINTR
-	}
-
-	var scratch [128]byte
-	var out []byte
-
-	// Check primary console (os.Stdin / serial)
-	if l.primaryFd >= 0 && l.primaryFd < 1024 && (fds.Bits[l.primaryFd/64]&(1<<(uint(l.primaryFd)%64))) != 0 {
-		m, err := syscall.Read(l.primaryFd, scratch[:])
-		if err == nil && m > 0 {
-			out = append(out, scratch[:m]...)
-		} else if m == 0 && err == nil {
-			return nil, false, true // EOF on primary
-		} else if err != nil && err != syscall.EINTR && err != syscall.EAGAIN {
+	var first byte
+	if d > 0 {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-done:
 			return nil, false, true
+		case b, ok := <-keyChan:
+			if !ok {
+				return nil, false, true
+			}
+			first = b
+		case <-timer.C:
+			return nil, false, false
+		}
+	} else {
+		select {
+		case <-done:
+			return nil, false, true
+		case b, ok := <-keyChan:
+			if !ok {
+				return nil, false, true
+			}
+			first = b
+		default:
+			return nil, false, false
 		}
 	}
 
-	// Check secondary console (/dev/tty0)
-	if l.ttyFd >= 0 && l.ttyFd < 1024 && (fds.Bits[l.ttyFd/64]&(1<<(uint(l.ttyFd)%64))) != 0 {
-		m, err := syscall.Read(l.ttyFd, scratch[:])
-		if err == nil && m > 0 {
-			out = append(out, scratch[:m]...)
+	out := []byte{first}
+drain:
+	for {
+		select {
+		case b, ok := <-keyChan:
+			if !ok {
+				break drain
+			}
+			out = append(out, b)
+		default:
+			break drain
 		}
 	}
 
-	if len(out) > 0 {
-		return out, true, false
-	}
-	return nil, false, false
+	return out, true, false
 }
 
-// Close restores the terminal state and closes the secondary descriptor.
+// Close restores terminal states and closes all opened secondary descriptors.
 func (l *KeyboardListener) Close() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.closed {
+		l.mu.Unlock()
 		return nil
 	}
 	l.closed = true
+	if l.done != nil {
+		close(l.done)
+	}
+	l.mu.Unlock()
 
-	if l.primaryFd >= 0 {
-		_ = syscall.SetNonblock(l.primaryFd, false)
+	// Restore all termios and cursor modes
+	for i := len(l.restores) - 1; i >= 0; i-- {
+		if l.restores[i] != nil {
+			l.restores[i]()
+		}
 	}
+	l.restores = nil
 
-	if l.restoreVT != nil {
-		l.restoreVT()
-		l.restoreVT = nil
+	// Close opened secondary files to unblock reader goroutines
+	var firstErr error
+	for _, f := range l.files {
+		if f != nil {
+			if err := f.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
 	}
-	if l.restoreTTY != nil {
-		l.restoreTTY()
-		l.restoreTTY = nil
-	}
-	if l.ttyFd >= 0 {
-		_ = syscall.Close(l.ttyFd)
-		l.ttyFd = -1
-	}
-	return nil
+	l.files = nil
+	l.ttyFd = -1
+
+	return firstErr
 }
