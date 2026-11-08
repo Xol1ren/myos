@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"syscall"
@@ -37,6 +38,9 @@ func makeRaw(fd int) (func(), error) {
 func (s *Shell) readLine(prompt string) (line string, eof bool) {
 	out := s.outFile()
 	inFd := int(s.inFile().Fd())
+	if inFd >= 0 {
+		_ = syscall.SetNonblock(inFd, false)
+	}
 	if !s.tty {
 		l, err := s.stdin.ReadString('\n')
 		if err != nil && l == "" {
@@ -76,6 +80,9 @@ func (s *Shell) readLine(prompt string) (line string, eof bool) {
 	for {
 		r, _, err := s.stdin.ReadRune()
 		if err != nil {
+			if errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.EAGAIN) {
+				continue
+			}
 			return "", true
 		}
 		switch r {

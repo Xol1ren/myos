@@ -45,6 +45,7 @@ func NewKeyboardListener(primaryFd int, secondaryPaths ...string) (*KeyboardList
 
 	// Primary console (typically serial or os.Stdin)
 	if primaryFd >= 0 {
+		_ = syscall.SetNonblock(primaryFd, false)
 		var st syscall.Stat_t
 		if err := syscall.Fstat(primaryFd, &st); err == nil && st.Rdev != 0 {
 			seenDevs[st.Rdev] = true
@@ -108,6 +109,7 @@ func (l *KeyboardListener) ensureInit() {
 		l.keyChan = make(chan byte, 512)
 		l.done = make(chan struct{})
 		if l.primaryFd >= 0 {
+			_ = syscall.SetNonblock(l.primaryFd, false)
 			var f *os.File
 			if l.primaryFd == int(os.Stdin.Fd()) {
 				f = os.Stdin
@@ -229,6 +231,18 @@ func (l *KeyboardListener) Poll(d time.Duration) (buf []byte, ok, eof bool) {
 	}
 
 	out := []byte{first}
+	// If first byte is ESC (0x1b), wait a brief moment for subsequent escape sequence bytes
+	if first == 0x1b {
+		escTimer := time.NewTimer(15 * time.Millisecond)
+		select {
+		case b, ok := <-keyChan:
+			escTimer.Stop()
+			if ok {
+				out = append(out, b)
+			}
+		case <-escTimer.C:
+		}
+	}
 drain:
 	for {
 		select {
@@ -238,6 +252,19 @@ drain:
 			}
 			out = append(out, b)
 		default:
+			// If we have an ESC sequence started (e.g. \x1b[), allow a small window for the command byte
+			if len(out) >= 2 && out[0] == 0x1b && len(out) < 8 {
+				seqTimer := time.NewTimer(10 * time.Millisecond)
+				select {
+				case b, ok := <-keyChan:
+					seqTimer.Stop()
+					if ok {
+						out = append(out, b)
+						continue
+					}
+				case <-seqTimer.C:
+				}
+			}
 			break drain
 		}
 	}
@@ -257,6 +284,11 @@ func (l *KeyboardListener) Close() error {
 		close(l.done)
 	}
 	l.mu.Unlock()
+
+	// Ensure primary descriptor remains strictly in blocking mode
+	if l.primaryFd >= 0 {
+		_ = syscall.SetNonblock(l.primaryFd, false)
+	}
 
 	// Restore all termios and cursor modes
 	for i := len(l.restores) - 1; i >= 0; i-- {

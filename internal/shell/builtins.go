@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"myos/internal/fb"
 	"myos/internal/input"
@@ -504,17 +505,32 @@ func biGui(s *Shell, io *IO, a []string) int {
 		return 1
 	}
 	defer dev.Close()
-	restoreTTY, err := makeRaw(0)
+
+	inFd := int(os.Stdin.Fd())
+	if inFd < 0 {
+		inFd = 0
+	}
+
+	// Capture original termios and enforce blocking mode on os.Stdin
+	var origTermios syscall.Termios
+	hasOrigTermios := sys.Ioctl(inFd, syscall.TCGETS, unsafe.Pointer(&origTermios)) == nil
+	_ = syscall.SetNonblock(inFd, false)
+
+	restoreTTY, err := makeRaw(inFd)
 	if err != nil {
 		fmt.Fprintln(io.Err, "gui:", err)
 		return 1
 	}
-	restoreCursor := fb.HideCursor(0)
+	restoreCursor := fb.HideCursor(inFd)
 	// Deferred in this order: close the GUI, restore hardware cursor, cooked tty,
-	// then repaint a clean console.
+	// restore original termios and blocking mode, then repaint a clean console.
 	defer func() {
 		restoreCursor()
 		restoreTTY()
+		if hasOrigTermios {
+			_ = sys.Ioctl(inFd, syscall.TCSETS, unsafe.Pointer(&origTermios))
+		}
+		_ = syscall.SetNonblock(inFd, false)
 		fmt.Fprint(os.Stdout, "\x1b[2J\x1b[H")
 	}()
 

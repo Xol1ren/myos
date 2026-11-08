@@ -78,13 +78,24 @@ func main() {
 		go bringUpNetwork()
 	}
 
+	backoff := time.Second
 	for {
+		start := time.Now()
 		runShell(mouse)
 		if !pid1 {
 			return
 		}
+		elapsed := time.Since(start)
 		fmt.Fprintln(os.Stderr, "[init] shell exited; respawning")
-		time.Sleep(200 * time.Millisecond)
+		if elapsed < 500*time.Millisecond {
+			time.Sleep(backoff)
+			if backoff < 8*time.Second {
+				backoff *= 2
+			}
+		} else {
+			backoff = time.Second
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
 }
 
@@ -95,6 +106,7 @@ func runShell(m *input.Mouse) {
 			logf("shell panic: %v", r)
 		}
 	}()
+	_ = syscall.SetNonblock(int(os.Stdin.Fd()), false)
 	shell.New(m).Run()
 }
 
