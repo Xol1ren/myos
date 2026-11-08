@@ -1,30 +1,30 @@
-# MYOS Release Candidate 3 (RC3) — Independent Release Audit Report
+# MYOS Release Candidate 3 (RC3) — Author Self-Review
 
-**Audit Target:** MYOS v0.3.0-rc3  
-**Commit / Tag:** [`f7cb318`](file:///home/azo/Documents/Github/Linux_Distributive) / `v0.3.0-rc3`  
-**Auditor:** Senior Linux Systems Engineer, Kernel UAPI Reviewer, and Release Auditor  
+**Review Target:** MYOS v0.3.0-rc3  
+**Commit / Tag:** `f7cb318` / `v0.3.0-rc3`  
+**Author:** Adilet Baktybekov  
 **Date:** November 7, 2026  
-**Host Environment:** Linux 7.0.12-101.fc43.x86_64, QEMU 10.0.0, Go 1.25.1 (`CGO_ENABLED=0`)
+**Host Environment:** Linux x86_64, QEMU, Go 1.25 (`CGO_ENABLED=0`)
 
 ---
 
-## 1. Executive Summary & Verdict
+## 1. Summary & Status
 
-### Release Verdict: **PASS (PRODUCTION READY FOR RC3 CANDIDATE EVALUATION)**
+### Status: **RC3 self-review: no known blockers at the time of writing**
 
-A comprehensive, non-destructive architectural review, security inspection, and stress test were conducted on the newly landed subsystem upgrades of MYOS RC3:
-1. **Interactive Graphical PTY Terminal:** Verified pure-Go Linux pseudo-terminal allocation (`/dev/ptmx`, `/dev/pts/*`), session management (`setsid`, `TIOCSCTTY`), clean descriptor lifecycle, and crash-resilient ANSI/VT100 terminal grid emulation.
-2. **Zero-Dependency Streaming HTTP/HTTPS Client (`fetch`):** Verified direct streaming to file/stdout with bounded O(1) buffer allocation (~16 KB), strict socket timeout deadlines, and hard recursion limits on cyclic HTTP redirects.
+A review and testing of the subsystem upgrades in MYOS RC3:
+1. **Interactive Graphical PTY Terminal:** Verified pure-Go Linux pseudo-terminal allocation (`/dev/ptmx`, `/dev/pts/*`), session management (`setsid`, `TIOCSCTTY`), clean descriptor lifecycle, and ANSI/VT100 terminal grid emulation.
+2. **Streaming HTTP/HTTPS Client (`fetch`):** Verified direct streaming to file/stdout with bounded O(1) buffer allocation (~16 KB), strict socket timeout deadlines, and recursion limits on cyclic HTTP redirects.
 3. **Block Storage Scanner & Early Mounts (`disks`):** Verified multi-instance `devpts` mounting, non-blocking `/sys/class/block` inspections, and `BLKGETSIZE64` ioctl safety across storage and virtual devices.
-4. **Desktop Concurrency & Multi-Cycle Durability:** Zero data races (`go test -race` clean), zero goroutine leaks across repeated window/desktop open-close cycles, and verified pixel-accurate dual-window composition inside QEMU hardware acceleration.
+4. **Desktop Concurrency & Multi-Cycle Durability:** Zero data races (`go test -race` clean), zero goroutine leaks across repeated window/desktop open-close cycles, and dual-window composition inside QEMU.
 
-No release blockers or security regressions were identified. Minor architectural observations and recommended optimizations are cataloged for RC4.
+No release blockers were identified. Architectural observations and planned optimizations are cataloged below for RC4.
 
 ---
 
 ## 2. Technical Findings by Subsystem
 
-### 2.1 PTY & Subprocess Subsystem ([`internal/fb/terminal.go`](file:///home/azo/Documents/Github/Linux_Distributive/internal/fb/terminal.go))
+### 2.1 PTY & Subprocess Subsystem ([`internal/fb/terminal.go`](../internal/fb/terminal.go))
 
 #### Resource & Descriptor Lifecycle
 - **Master Allocation (`OpenPTY`):** Master descriptor is acquired via `/dev/ptmx` with automatic fallback to `/dev/pts/ptmx` using `O_RDWR | syscall.O_CLOEXEC`.
@@ -48,7 +48,7 @@ No release blockers or security regressions were identified. Minor architectural
   }
   ```
   This creates a new session leader via `setsid(2)` and assigns the slave pseudo-terminal as the controlling terminal (`TIOCSCTTY`).
-- **Zombie Reaping:** Verified integration with [`internal/proc/proc.go`](file:///home/azo/Documents/Github/Linux_Distributive/internal/proc/proc.go):
+- **Zombie Reaping:** Verified integration with [`internal/proc/proc.go`](../internal/proc/proc.go):
   - PID 1 runs `proc.StartReaper()` which handles `SIGCHLD` and reaps orphaned or exited children via non-blocking `wait4(-1, &ws, WNOHANG, nil)`.
   - The reader goroutine in `terminal.go` also calls `cmd.Wait()` asynchronously. If PID 1's reaper claims the exit status first, Go's `cmd.Wait()` safely returns `ECHILD` without panic and sets `t.active = false`. Children are guaranteed never to linger as uncollected zombies.
 
@@ -60,7 +60,7 @@ No release blockers or security regressions were identified. Minor architectural
 
 ---
 
-### 2.2 Networking & HTTP Engine ([`internal/netcfg/http.go`](file:///home/azo/Documents/Github/Linux_Distributive/internal/netcfg/http.go))
+### 2.2 Networking & HTTP Engine ([`internal/netcfg/http.go`](../internal/netcfg/http.go))
 
 #### Streaming Memory Footprint
 - **Direct Disk Streaming:** When `-o output_path` is specified, data is written directly to the filesystem handle via 16 KB chunks (`buf := make([]byte, 16*1024)` in raw mode, `io.CopyN` in chunked mode).
@@ -78,7 +78,7 @@ No release blockers or security regressions were identified. Minor architectural
 - **Cyclic Redirect Protection:** Redirects (HTTP 301, 302, 303, 307, 308) are capped at a strict maximum of 5 hops (`if redirects > 5 { return nil, errors.New("fetch: too many redirects (>5)") }`), preventing infinite loops and stack exhaustion.
 
 #### Transfer Speed Calculation
-- In [`internal/shell/builtins.go`](file:///home/azo/Documents/Github/Linux_Distributive/internal/shell/builtins.go), transfer speed is computed as:
+- In [`internal/shell/builtins.go`](../internal/shell/builtins.go), transfer speed is computed as:
   ```go
   rate := float64(res.BytesRead) / (time.Since(start).Seconds() + 0.001)
   ```
@@ -86,7 +86,7 @@ No release blockers or security regressions were identified. Minor architectural
 
 ---
 
-### 2.3 Storage Scanner & Early Mounts ([`internal/sys/disk.go`](file:///home/azo/Documents/Github/Linux_Distributive/internal/sys/disk.go), [`internal/sys/sys.go`](file:///home/azo/Documents/Github/Linux_Distributive/internal/sys/sys.go))
+### 2.3 Storage Scanner & Early Mounts ([`internal/sys/disk.go`](../internal/sys/disk.go), [`internal/sys/sys.go`](../internal/sys/sys.go))
 
 #### Early Mounts Hygiene
 - In `internal/sys/sys.go`, `MountEarly()` mounts:
