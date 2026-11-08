@@ -1,5 +1,8 @@
 # myos: a pure-Go Linux userspace
 
+[![CI Pipeline](https://github.com/Xol1ren/myos/actions/workflows/ci.yml/badge.svg)](https://github.com/Xol1ren/myos/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 Static `CGO_ENABLED=0` Go binary as PID 1 (`/init`): no glibc, systemd or busybox.
 It provides the init and reaper, DHCP networking, a PS/2 mouse tracker, a shell with
 builtin coreutils, a TUI system monitor and a framebuffer desktop.
@@ -76,4 +79,9 @@ Variables: `KERNEL`, `MODULES` (kernel modules to bundle; empty to disable), `ME
 - There is no job control, so Ctrl-C cannot interrupt external programs.
 - Line editing assumes the input fits on one terminal row.
 - `make run`, `make run-iso` (BIOS), and `make run-iso-uefi` (UEFI) have been verified under QEMU; DRM/KMS fallback diagnostics are provided when `/dev/fb0` is absent.
+- ISO and QEMU targets require root privileges, host kernel images, and specialized toolchains (`xorriso`, `syslinux`, `mtools`, `qemu`), and are verified manually rather than in automated CI workflows.
+
+## Documentation
+
+- [docs/SELF_REVIEW_RC3.md](docs/SELF_REVIEW_RC3.md): Release Candidate 3 self-review detailing PTY emulation, HTTP engine, storage scanner, test coverage, and benchmark profiles.
 
