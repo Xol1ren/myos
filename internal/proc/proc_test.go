@@ -101,4 +101,38 @@ func TestWaitChildAlreadyExited(t *testing.T) {
 	if !ws.Exited() || ws.ExitStatus() != 0 {
 		t.Fatalf("expected exit 0 for already reaped child, got %v", ws)
 	}
+	mu.Lock()
+	_, inExited := exited[pid]
+	_, inReg := registered[pid]
+	mu.Unlock()
+	if inExited || inReg {
+		t.Fatalf("expected pid %d to be cleaned up from exited/registered maps", pid)
+	}
+}
+
+func TestUnregisteredChildDoesNotLeakInExited(t *testing.T) {
+	sh, err := exec.LookPath("true")
+	if err != nil {
+		sh = "/bin/true"
+	}
+	StartReaper()
+	// Spawn directly via ForkExec without registering in proc
+	pid, err := SpawnAttr(sh, []string{"true"}, os.Environ(), []uintptr{0, 1, 2}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an unregistered orphan by removing from registered before reap
+	mu.Lock()
+	delete(registered, pid)
+	mu.Unlock()
+
+	time.Sleep(100 * time.Millisecond)
+	reap()
+
+	mu.Lock()
+	_, leaked := exited[pid]
+	mu.Unlock()
+	if leaked {
+		t.Fatalf("unregistered orphan pid %d leaked into exited map", pid)
+	}
 }

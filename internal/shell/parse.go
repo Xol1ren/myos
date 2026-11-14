@@ -262,15 +262,19 @@ func (s *Shell) execute(stages []stage) int {
 	codes := make(chan [2]int, n)
 	for i := range stages {
 		go func(i int) {
-			code := s.runStage(stages[i], ins[i], outs[i])
-			// Close our ends so downstream readers see EOF.
-			if !s.isStd(ins[i]) {
-				ins[i].Close()
-			}
-			if !s.isStd(outs[i]) {
-				outs[i].Close()
-			}
-			codes <- [2]int{i, code}
+			var code int
+			defer func() {
+				// Always close our pipe/redirection ends before signaling completion
+				// so upstream/downstream stages never deadlock even on panic.
+				if !s.isStd(ins[i]) {
+					_ = ins[i].Close()
+				}
+				if !s.isStd(outs[i]) {
+					_ = outs[i].Close()
+				}
+				codes <- [2]int{i, code}
+			}()
+			code = s.runStage(stages[i], ins[i], outs[i])
 		}(i)
 	}
 	last := 0
