@@ -20,6 +20,7 @@ const (
 	siocSIFADDR  = 0x8916
 	siocSIFNMASK = 0x891c
 	siocADDRT    = 0x890b
+	siocDELRT    = 0x890c
 	siocSIFMTU   = 0x8922
 
 	iffUp = 0x1
@@ -122,10 +123,15 @@ func SetMTU(name string, mtu int) error {
 	})
 }
 
-// AddDefaultRoute installs 0.0.0.0/0 via gw.
+// AddDefaultRoute installs 0.0.0.0/0 via gw, replacing any prior default route.
 func AddDefaultRoute(name string, gw net.IP) error {
 	return withSocket(func(fd int) error {
 		dev := append([]byte(name), 0)
+		// Remove any existing default route first so gateway changes take effect cleanly
+		delRT := rtentry{flags: rtfUp}
+		delRT.dst.Family, delRT.genmask.Family = syscall.AF_INET, syscall.AF_INET
+		_ = sys.Ioctl(fd, siocDELRT, unsafe.Pointer(&delRT))
+
 		rt := rtentry{flags: rtfUp | rtfGateway, dev: &dev[0]}
 		rt.dst.Family, rt.gateway.Family, rt.genmask.Family = syscall.AF_INET, syscall.AF_INET, syscall.AF_INET
 		copy(rt.gateway.Addr[:], gw.To4())

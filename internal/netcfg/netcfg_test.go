@@ -167,3 +167,14 @@ func TestLinkNameTooLong(t *testing.T) {
 		t.Fatal("expected error for oversized interface name")
 	}
 }
+
+func TestInvalidMACLengthRejected(t *testing.T) {
+	good := serverReply(7, dhcpOffer, testMAC)
+	longMAC := make(net.HardwareAddr, 20)
+	if _, err := parseReply(good, 7, longMAC); err == nil {
+		t.Fatal("expected error for 20-byte non-Ethernet MAC in parseReply")
+	}
+	if _, err := DHCP(&net.Interface{Name: "ib0", HardwareAddr: longMAC}, 1, func(string, ...any) {}); err == nil {
+		t.Fatal("expected error for 20-byte non-Ethernet MAC in DHCP")
+	}
+}
