@@ -13,14 +13,14 @@ graphical desktop with an embedded PTY terminal emulator.
 
 | Path | Purpose |
 |------|---------|
-| `cmd/init` | PID 1: mounts, console, modules, signals, network & DHCP renewal, mouse, shell |
-| `internal/sys` | mount, ioctl, console TTY resolution (`TIOCSCTTY`), module loading, block disk scanner (`disks`), shutdown |
+| `cmd/init` | PID 1: mounts, console, modules, signals, network & DHCP renewal, `httpd` telemetry, mouse, shell |
+| `internal/sys` | mount (`Mount`, `MountAuto`, `Umount`), ioctl, console TTY resolution (`TIOCSCTTY`), module loading, block disk scanner (`disks`), shutdown |
 | `internal/proc` | atomic PID-registered zombie reaper (`wait4`) and child spawning (`Spawn`/`SpawnAttr`) |
-| `internal/netcfg` | ioctl network setup, DHCPv4 client, and streaming HTTP/HTTPS client (`fetch`) |
+| `internal/netcfg` | ioctl network setup, DHCPv4 client, streaming HTTP/HTTPS client (`fetch`), and live Web Telemetry server (`httpd`) |
 | `internal/input` | `/dev/input/mice` PS/2 decoder, dynamic bounds clamping, and cursor state |
-| `internal/shell` | `TIOCGWINSZ`-aware line editor, process-group job control (`TIOCSPGRP`), pipes, redirection, builtins |
+| `internal/shell` | `TIOCGWINSZ`-aware line editor, nano-style `edit` text editor, job control (`TIOCSPGRP`), pipes, redirection, builtins |
 | `internal/monitor` | `syshud` zero-allocation `/proc` & `sysinfo(2)` telemetry dashboard |
-| `internal/fb` | DRM/KMS dumb-buffer & `/dev/fb0` backends, `epoll`+`eventfd` dual keyboard listener, PTY terminal (`/dev/ptmx`), 60 FPS desktop |
+| `internal/fb` | DRM/KMS & `/dev/fb0` backends, `epoll`+`eventfd` keyboard, PTY terminal, multi-window Z-order desktop, dock, and File Explorer |
 | `scripts/mkmodules.sh` | stage kernel modules into the initramfs |
 | `scripts/mkiso.sh` | build the hybrid BIOS and UEFI ISO |
 
@@ -53,16 +53,18 @@ Variables: `KERNEL`, `MODULES` (kernel modules to bundle; empty to disable), `ME
 
 ## Shell builtins
 
-`ls cat ip ping fetch disks mouse syshud gui cd pwd echo clear history help exit poweroff reboot`, plus:
+`ls cat ip ping fetch disks mount umount edit httpd mouse syshud gui cd pwd echo clear history help exit poweroff reboot`, plus:
 
+- `mount [-t fstype] <device> <target>` / `umount <target>`: mounts block devices or pseudo-filesystems (auto-probing `ext4`, `vfat`, `iso9660`, `tmpfs` when `-t` is omitted) and creates target directories automatically. `make run` provisions a 64MB `build/disk.img` VirtIO drive.
+- `edit <filepath>`: interactive nano-style terminal text editor in raw `termios` mode with alternate-screen restoration, arrow/Home/End/PageUp/PageDown navigation, viewport scrolling, `Ctrl+S` save, and `Ctrl+Q` quit.
+- `httpd <start [port]|stop|status>`: background HTTP telemetry control plane (default `:8080`, forwarded to host `http://localhost:8080` in `make run`) serving a dark-mode live dashboard at `/` and JSON metrics at `/api/metrics`.
 - `syshud [iface]` shows live CPU and RAM bars, RX/TX KB/s (default `eth0`, falling back to the first
   non-loopback interface), process count (`sysinfo(2)`) and uptime. Each frame is written with one `write(2)` onto the
   alternate screen. Exit with `q` or Ctrl+C. The terminal, cursor and screen are always restored.
-- `gui [device]` runs a 60 FPS graphical desktop using DRM/KMS dumb buffers (`/dev/dri/card*`, falling back to
-  `/dev/fb0`): a top bar (clock, CPU, memory, backend indicator, and `[Exit]` button), a draggable system telemetry
-  window, and an interactive PTY terminal emulator window (`/dev/ptmx`, `TIOCGPTPEER`, ANSI/UTF-8 grid).
-  Keyboard input is multiplexed across `os.Stdin` and `/dev/tty0`–`/dev/tty1` via `epoll(7)` and `eventfd(2)` in
-  `KD_TEXT` raw `termios` mode. Exit by clicking `[Exit]` or pressing `Ctrl+Q`.
+- `gui [device]` runs a 60 FPS multi-window graphical desktop using DRM/KMS dumb buffers (`/dev/dri/card*`, falling back to
+  `/dev/fb0`): a top bar, Z-ordered draggable windows with minimize `[-]` / close `[x]` buttons, a bottom dock with
+  `[+ Terminal]` (up to 4 concurrent PTY terminals), `[Files]` (graphical File Explorer with preview and `[Open in Terminal Editor]`),
+  and `[Telemetry]` launchers. Exit by clicking `[Exit]` or pressing `Ctrl+Q`.
 - `fetch [-k] <url> [-o file]` downloads resources over HTTP/1.1 or HTTPS (TLS 1.2/1.3) with chunked transfer
   decoding, redirect following (up to 5 hops), bounded header parsing, and live progress telemetry.
 - `disks` enumerates block devices and partitions (`/sys/class/block`, `/dev/sd*`, `/dev/vd*`, `/dev/nvme*`),

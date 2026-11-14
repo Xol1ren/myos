@@ -76,6 +76,11 @@ func main() {
 			logf("loopback: %v", err)
 		}
 		go bringUpNetwork()
+		if err := netcfg.DefaultHTTPD.Start(":8080"); err != nil {
+			logf("httpd: %v", err)
+		} else {
+			logf("httpd listening on :8080")
+		}
 	}
 
 	backoff := time.Second
