@@ -22,10 +22,21 @@ import (
 	"myos/internal/sys"
 )
 
-// IO is the stdio of a builtin (may be pipes or redirected files).
+// IO is the stdio and stage-local environment of a builtin (may be pipes or redirected files).
 type IO struct {
 	In       io.Reader
 	Out, Err io.Writer
+	Env      map[string]string
+}
+
+// Getenv returns a stage-local environment variable if set, falling back to os.Getenv.
+func (io *IO) Getenv(key string) string {
+	if io != nil && io.Env != nil {
+		if v, ok := io.Env[key]; ok {
+			return v
+		}
+	}
+	return os.Getenv(key)
 }
 
 type builtinFn func(s *Shell, io *IO, args []string) int
@@ -93,7 +104,7 @@ func biCd(_ *Shell, io *IO, a []string) int {
 	dir := "/"
 	if len(a) > 1 {
 		dir = a[1]
-	} else if h := os.Getenv("HOME"); h != "" {
+	} else if h := io.Getenv("HOME"); h != "" {
 		dir = h
 	}
 	if err := os.Chdir(dir); err != nil {
@@ -407,12 +418,26 @@ func biMouse(s *Shell, io *IO, a []string) int {
 	defer restore()
 
 	quit := make(chan struct{})
+	klist, err := fb.OpenDualKeyboard()
+	if err != nil {
+		fmt.Fprintln(io.Err, "mouse:", err)
+		return 1
+	}
+	defer klist.Close()
 	go func() {
-		b := make([]byte, 1)
 		for {
-			if _, err := os.Stdin.Read(b); err != nil || b[0] == 'q' || b[0] == 3 {
+			buf, ok, eof := klist.Poll(100 * time.Millisecond)
+			if eof {
 				close(quit)
 				return
+			}
+			if ok {
+				for _, b := range buf {
+					if b == 'q' || b == 'Q' || b == 3 {
+						close(quit)
+						return
+					}
+				}
 			}
 		}
 	}()
@@ -511,10 +536,9 @@ func biGui(s *Shell, io *IO, a []string) int {
 		inFd = 0
 	}
 
-	// Capture original termios and enforce blocking mode on os.Stdin
+	// Capture original termios on os.Stdin
 	var origTermios syscall.Termios
 	hasOrigTermios := sys.Ioctl(inFd, syscall.TCGETS, unsafe.Pointer(&origTermios)) == nil
-	_ = syscall.SetNonblock(inFd, false)
 
 	restoreTTY, err := makeRaw(inFd)
 	if err != nil {
@@ -523,14 +547,13 @@ func biGui(s *Shell, io *IO, a []string) int {
 	}
 	restoreCursor := fb.HideCursor(inFd)
 	// Deferred in this order: close the GUI, restore hardware cursor, cooked tty,
-	// restore original termios and blocking mode, then repaint a clean console.
+	// restore original termios, then repaint a clean console.
 	defer func() {
 		restoreCursor()
 		restoreTTY()
 		if hasOrigTermios {
 			_ = sys.Ioctl(inFd, syscall.TCSETS, unsafe.Pointer(&origTermios))
 		}
-		_ = syscall.SetNonblock(inFd, false)
 		fmt.Fprint(os.Stdout, "\x1b[2J\x1b[H")
 	}()
 
@@ -592,27 +615,37 @@ func biDisks(_ *Shell, io *IO, _ []string) int {
 	return 0
 }
 
-// biFetch downloads files over HTTP/HTTPS: fetch <url> [-o output_file]
+// biFetch downloads files over HTTP/HTTPS: fetch [-k] <url> [-o output_file]
 func biFetch(_ *Shell, io *IO, args []string) int {
 	if len(args) < 2 {
-		fmt.Fprintln(io.Err, "usage: fetch <url> [-o output_file]")
+		fmt.Fprintln(io.Err, "usage: fetch [-k] <url> [-o output_file]")
 		return 1
 	}
-	rawURL := args[1]
+	rawURL := ""
 	outPath := ""
-	for i := 2; i < len(args); i++ {
+	insecure := false
+	for i := 1; i < len(args); i++ {
 		if args[i] == "-o" && i+1 < len(args) {
 			outPath = args[i+1]
 			i++
+		} else if args[i] == "-k" {
+			insecure = true
+		} else if rawURL == "" {
+			rawURL = args[i]
 		}
+	}
+	if rawURL == "" {
+		fmt.Fprintln(io.Err, "usage: fetch [-k] <url> [-o output_file]")
+		return 1
 	}
 
 	fmt.Fprintf(io.Err, "fetching %s ...\n", rawURL)
 	start := time.Now()
 	res, err := netcfg.Fetch(context.Background(), rawURL, netcfg.FetchOptions{
-		Timeout: 30 * time.Second,
-		Out:     io.Out,
-		OutPath: outPath,
+		Timeout:  30 * time.Second,
+		Out:      io.Out,
+		OutPath:  outPath,
+		Insecure: insecure,
 		Progress: func(downloaded, total int64, elapsed time.Duration, done bool) {
 			if total > 0 {
 				pct := (downloaded * 100) / total
@@ -629,6 +662,10 @@ func biFetch(_ *Shell, io *IO, args []string) int {
 		fmt.Fprintf(io.Err, "fetch: %v\n", err)
 		return 1
 	}
+	if res.StatusCode >= 400 {
+		fmt.Fprintf(io.Err, "fetch: HTTP %d %s\n", res.StatusCode, res.StatusText)
+		return 1
+	}
 
 	rate := float64(res.BytesRead) / (time.Since(start).Seconds() + 0.001)
 	dest := "stdout"
@@ -639,4 +676,3 @@ func biFetch(_ *Shell, io *IO, args []string) int {
 		res.BytesRead, res.Duration.Round(time.Millisecond), sys.FormatBytes(uint64(rate)), dest, res.StatusCode, res.StatusText)
 	return 0
 }
-

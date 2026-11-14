@@ -223,9 +223,6 @@ func TestAttachConsole(t *testing.T) {
 		_ = syscall.Close(s0)
 		_ = syscall.Close(s1)
 		_ = syscall.Close(s2)
-		os.Stdin = os.NewFile(0, "/dev/stdin")
-		os.Stdout = os.NewFile(1, "/dev/stdout")
-		os.Stderr = os.NewFile(2, "/dev/stderr")
 	}()
 
 	if err := AttachConsole(tmp); err != nil {
@@ -234,5 +231,17 @@ func TestAttachConsole(t *testing.T) {
 	var b [5]byte
 	if n, err := os.Stdin.Read(b[:]); err != nil || string(b[:n]) != "hello" {
 		t.Fatalf("read from attached console: %q, %v", string(b[:n]), err)
+	}
+}
+
+func TestResolveConsoleDevice(t *testing.T) {
+	if got := ResolveConsoleDevice("tty1 ttyS0\n"); got != "/dev/ttyS0" {
+		t.Fatalf("got %q, want /dev/ttyS0", got)
+	}
+	if got := ResolveConsoleDevice("tty0\n"); got != "/dev/tty0" {
+		t.Fatalf("got %q, want /dev/tty0", got)
+	}
+	if got := ResolveConsoleDevice(""); got != "/dev/console" {
+		t.Fatalf("got %q, want /dev/console", got)
 	}
 }

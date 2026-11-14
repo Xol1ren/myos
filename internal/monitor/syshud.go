@@ -9,35 +9,73 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
+
+func parseUintBytes(b []byte) (uint64, error) {
+	if len(b) == 0 {
+		return 0, strconv.ErrSyntax
+	}
+	var v uint64
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, strconv.ErrSyntax
+		}
+		v = v*10 + uint64(c-'0')
+	}
+	return v, nil
+}
+
+func nextField(b []byte) (field, rest []byte) {
+	i := 0
+	for i < len(b) && (b[i] == ' ' || b[i] == '\t' || b[i] == '\r') {
+		i++
+	}
+	b = b[i:]
+	j := 0
+	for j < len(b) && b[j] != ' ' && b[j] != '\t' && b[j] != '\r' {
+		j++
+	}
+	return b[:j], b[j:]
+}
 
 // CPUTimes is the aggregate jiffy counters from the first line of /proc/stat.
 type CPUTimes struct{ Idle, Total uint64 }
 
-// ParseStat parses the aggregate "cpu " line of /proc/stat.
+// ParseStat parses the aggregate "cpu " line of /proc/stat without heap allocations.
 func ParseStat(data []byte) (CPUTimes, error) {
-	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.HasPrefix(line, "cpu ") {
+	for len(data) > 0 {
+		var line []byte
+		if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
+			line, data = data[:idx], data[idx+1:]
+		} else {
+			line, data = data, nil
+		}
+		if !bytes.HasPrefix(line, []byte("cpu ")) {
 			continue
 		}
-		f := strings.Fields(line)[1:]
-		if len(f) < 4 {
-			break
-		}
+		rest := line[4:]
 		var t CPUTimes
-		for i, s := range f {
-			if i >= 8 { // guest times are already included in user/nice
+		count := 0
+		for count < 8 {
+			tok, r := nextField(rest)
+			if len(tok) == 0 {
 				break
 			}
-			v, err := strconv.ParseUint(s, 10, 64)
+			rest = r
+			v, err := parseUintBytes(tok)
 			if err != nil {
 				return CPUTimes{}, err
 			}
 			t.Total += v
-			if i == 3 || i == 4 { // idle + iowait
+			if count == 3 || count == 4 { // idle + iowait
 				t.Idle += v
 			}
+			count++
+		}
+		if count < 4 {
+			break
 		}
 		return t, nil
 	}
@@ -85,32 +123,39 @@ func (m MemInfo) Percent() float64 {
 	return float64(m.UsedKB()) * 100 / float64(m.TotalKB)
 }
 
-// ParseMemInfo parses /proc/meminfo.
+// ParseMemInfo parses /proc/meminfo without per-line string allocations.
 func ParseMemInfo(data []byte) (MemInfo, error) {
 	var m MemInfo
-	for _, line := range strings.Split(string(data), "\n") {
-		k, rest, ok := strings.Cut(line, ":")
-		if !ok {
+	for len(data) > 0 {
+		var line []byte
+		if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
+			line, data = data[:idx], data[idx+1:]
+		} else {
+			line, data = data, nil
+		}
+		colon := bytes.IndexByte(line, ':')
+		if colon < 0 {
 			continue
 		}
+		k, rest := line[:colon], line[colon+1:]
 		var dst *uint64
-		switch k {
-		case "MemTotal":
+		switch {
+		case bytes.Equal(k, []byte("MemTotal")):
 			dst = &m.TotalKB
-		case "MemAvailable":
+		case bytes.Equal(k, []byte("MemAvailable")):
 			dst = &m.AvailKB
-		case "Buffers":
+		case bytes.Equal(k, []byte("Buffers")):
 			dst = &m.BuffersKB
-		case "Cached":
+		case bytes.Equal(k, []byte("Cached")):
 			dst = &m.CachedKB
 		default:
 			continue
 		}
-		f := strings.Fields(rest)
-		if len(f) == 0 {
+		tok, _ := nextField(rest)
+		if len(tok) == 0 {
 			continue
 		}
-		v, err := strconv.ParseUint(f[0], 10, 64)
+		v, err := parseUintBytes(tok)
 		if err != nil {
 			return m, err
 		}
@@ -142,21 +187,48 @@ type NetCounters struct {
 func ParseNetDev(data []byte, iface string) (NetCounters, bool) {
 	var fallback NetCounters
 	haveFallback := false
-	for _, line := range strings.Split(string(data), "\n") {
-		name, rest, ok := strings.Cut(line, ":")
-		if !ok {
+	for len(data) > 0 {
+		var line []byte
+		if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
+			line, data = data[:idx], data[idx+1:]
+		} else {
+			line, data = data, nil
+		}
+		colon := bytes.IndexByte(line, ':')
+		if colon < 0 {
 			continue // header lines
 		}
-		name = strings.TrimSpace(name)
-		f := strings.Fields(rest)
-		if len(f) < 9 {
+		nameBytes := bytes.TrimSpace(line[:colon])
+		rest := line[colon+1:]
+		var rx, tx uint64
+		okFields := true
+		for i := 0; i <= 8; i++ {
+			var tok []byte
+			tok, rest = nextField(rest)
+			if len(tok) == 0 {
+				okFields = false
+				break
+			}
+			if i == 0 {
+				v, err := parseUintBytes(tok)
+				if err != nil {
+					okFields = false
+					break
+				}
+				rx = v
+			} else if i == 8 {
+				v, err := parseUintBytes(tok)
+				if err != nil {
+					okFields = false
+					break
+				}
+				tx = v
+			}
+		}
+		if !okFields {
 			continue
 		}
-		rx, err1 := strconv.ParseUint(f[0], 10, 64)
-		tx, err2 := strconv.ParseUint(f[8], 10, 64)
-		if err1 != nil || err2 != nil {
-			continue
-		}
+		name := string(nameBytes)
 		c := NetCounters{Name: name, RX: rx, TX: tx}
 		if name == iface {
 			return c, true
@@ -181,8 +253,15 @@ func ParseUptime(data []byte) (time.Duration, error) {
 	return time.Duration(s * float64(time.Second)), nil
 }
 
-// CountProcs counts numeric directories under procDir.
+// CountProcs returns the active process count using sysinfo(2) when querying /proc,
+// or counts numeric directories under custom procDir paths in tests.
 func CountProcs(procDir string) int {
+	if procDir == "" || procDir == "/proc" {
+		var si syscall.Sysinfo_t
+		if err := syscall.Sysinfo(&si); err == nil && si.Procs > 0 {
+			return int(si.Procs)
+		}
+	}
 	d, err := os.Open(procDir)
 	if err != nil {
 		return 0

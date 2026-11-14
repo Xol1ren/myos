@@ -7,15 +7,21 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
+	"unsafe"
 
 	"myos/internal/fb"
 	"myos/internal/input"
 	"myos/internal/proc"
+	"myos/internal/sys"
 )
+
+const ioctlTIOCSPGRP = 0x5410
 
 // Shell is the interactive REPL state.
 type Shell struct {
@@ -106,6 +112,9 @@ func (s *Shell) Run() {
 		s.stdin = bufio.NewReader(s.in)
 	}
 	s.tty = isTTY(int(s.in.Fd()))
+	if s.tty {
+		signal.Ignore(syscall.SIGTTOU, syscall.SIGTTIN)
+	}
 
 	for {
 		line, eof := s.readLine(s.Prompt)
@@ -179,30 +188,16 @@ func (s *Shell) runStage(st stage, in, out *os.File) int {
 		return 0
 	}
 	if b, ok := builtins[args[0]]; ok {
+		var stageEnv map[string]string
 		if len(st.env) > 0 {
-			orig := map[string]string{}
-			unset := map[string]bool{}
+			stageEnv = make(map[string]string, len(st.env))
 			for _, e := range st.env {
-				k, v, ok := strings.Cut(e, "=")
-				if ok {
-					if old, exists := os.LookupEnv(k); exists {
-						orig[k] = old
-					} else {
-						unset[k] = true
-					}
-					_ = os.Setenv(k, v)
+				if k, v, ok := strings.Cut(e, "="); ok {
+					stageEnv[k] = v
 				}
 			}
-			defer func() {
-				for k, v := range orig {
-					_ = os.Setenv(k, v)
-				}
-				for k := range unset {
-					_ = os.Unsetenv(k)
-				}
-			}()
 		}
-		return b(s, &IO{In: in, Out: out, Err: s.errFile()}, args)
+		return b(s, &IO{In: in, Out: out, Err: s.errFile(), Env: stageEnv}, args)
 	}
 	return s.runExternal(args, st.env, in, out)
 }
@@ -217,10 +212,22 @@ func (s *Shell) runExternal(args []string, extraEnv []string, in, out *os.File) 
 	if len(extraEnv) > 0 {
 		env = append(append([]string(nil), env...), extraEnv...)
 	}
-	pid, err := proc.Spawn(path, args, env, []uintptr{in.Fd(), out.Fd(), s.errFile().Fd()})
+	sysAttr := &syscall.SysProcAttr{
+		Setpgid: true,
+	}
+	pid, err := proc.SpawnAttr(path, args, env, []uintptr{in.Fd(), out.Fd(), s.errFile().Fd()}, sysAttr)
 	if err != nil {
 		fmt.Fprintf(s.errFile(), "myos: %s: %v\n", args[0], err)
 		return 126
+	}
+	if s.tty {
+		ttyFd := int(s.inFile().Fd())
+		shellPgrp := int32(syscall.Getpgrp())
+		childPgrp := int32(pid)
+		_ = sys.Ioctl(ttyFd, ioctlTIOCSPGRP, unsafe.Pointer(&childPgrp))
+		defer func() {
+			_ = sys.Ioctl(ttyFd, ioctlTIOCSPGRP, unsafe.Pointer(&shellPgrp))
+		}()
 	}
 	ws := proc.Wait(pid)
 	switch {

@@ -25,6 +25,33 @@ type FetchOptions struct {
 	OutPath   string
 	Progress  FetchProgressCallback
 	UserAgent string
+	Insecure  bool
+}
+
+const (
+	maxHTTPHeaderLineBytes = 8192
+	maxHTTPHeaders         = 128
+)
+
+// readBoundedLine reads a single '\n'-terminated line up to maxBytes, returning
+// an error if the line exceeds maxBytes before a newline is encountered.
+func readBoundedLine(r *bufio.Reader, maxBytes int) (string, error) {
+	var buf []byte
+	for {
+		frag, isPrefix, err := r.ReadLine()
+		if len(frag) > 0 {
+			if len(buf)+len(frag) > maxBytes {
+				return "", errors.New("line exceeds maximum length")
+			}
+			buf = append(buf, frag...)
+		}
+		if err != nil {
+			return string(buf), err
+		}
+		if !isPrefix {
+			return string(buf), nil
+		}
+	}
 }
 
 // FetchResult provides transfer metrics after completion.
@@ -78,9 +105,13 @@ func fetchWithRedirects(ctx context.Context, rawURL string, opts FetchOptions, r
 	if scheme == "https" {
 		tlsConfig := &tls.Config{
 			ServerName:         hostOnly,
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: opts.Insecure,
 		}
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
+		tlsDialer := &tls.Dialer{
+			NetDialer: dialer,
+			Config:    tlsConfig,
+		}
+		conn, err = tlsDialer.DialContext(ctx, "tcp", addr)
 	} else {
 		conn, err = dialer.DialContext(ctx, "tcp", addr)
 	}
@@ -107,14 +138,13 @@ func fetchWithRedirects(ctx context.Context, rawURL string, opts FetchOptions, r
 	}
 
 	startTime := time.Now()
-	reader := bufio.NewReader(conn)
+	reader := bufio.NewReaderSize(conn, maxHTTPHeaderLineBytes)
 
-	// Read status line
-	statusLine, err := reader.ReadString('\n')
+	// Read status line (bounded)
+	statusLine, err := readBoundedLine(reader, maxHTTPHeaderLineBytes)
 	if err != nil {
 		return nil, fmt.Errorf("fetch: read status: %w", err)
 	}
-	statusLine = strings.TrimRight(statusLine, "\r\n")
 	parts := strings.SplitN(statusLine, " ", 3)
 	if len(parts) < 2 {
 		return nil, fmt.Errorf("fetch: malformed status line: %q", statusLine)
@@ -128,14 +158,16 @@ func fetchWithRedirects(ctx context.Context, rawURL string, opts FetchOptions, r
 		statusText = parts[2]
 	}
 
-	// Read headers
+	// Read headers (bounded per line and total header count)
 	headers := make(map[string]string)
-	for {
-		line, err := reader.ReadString('\n')
+	for hdrCount := 0; ; hdrCount++ {
+		if hdrCount >= maxHTTPHeaders {
+			return nil, errors.New("fetch: too many HTTP response headers")
+		}
+		line, err := readBoundedLine(reader, maxHTTPHeaderLineBytes)
 		if err != nil {
 			return nil, fmt.Errorf("fetch: read header: %w", err)
 		}
-		line = strings.TrimRight(line, "\r\n")
 		if line == "" {
 			break
 		}
@@ -145,14 +177,24 @@ func fetchWithRedirects(ctx context.Context, rawURL string, opts FetchOptions, r
 		}
 	}
 
-	// Redirect check (301, 302, 303, 307, 308)
+	// Redirect check (301, 302, 303, 307, 308): close current socket before recursing
 	if statusCode >= 301 && statusCode <= 308 && statusCode != 304 && statusCode != 305 && statusCode != 306 {
 		if loc, ok := headers["location"]; ok && loc != "" {
 			nextURL, err := u.Parse(loc)
 			if err == nil {
+				_ = conn.Close()
 				return fetchWithRedirects(ctx, nextURL.String(), opts, redirects+1)
 			}
 		}
+	}
+
+	// Do not create/truncate output file or return success on HTTP error responses (>= 400)
+	if statusCode >= 400 {
+		return &FetchResult{
+			StatusCode: statusCode,
+			StatusText: statusText,
+			Duration:   time.Since(startTime),
+		}, fmt.Errorf("fetch: HTTP %d %s", statusCode, statusText)
 	}
 
 	var dest io.Writer
@@ -198,7 +240,7 @@ func fetchWithRedirects(ctx context.Context, rawURL string, opts FetchOptions, r
 		// Read chunked encoding
 		for {
 			_ = conn.SetDeadline(time.Now().Add(timeout))
-			line, err := reader.ReadString('\n')
+			line, err := readBoundedLine(reader, maxHTTPHeaderLineBytes)
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					break
@@ -229,8 +271,8 @@ func fetchWithRedirects(ctx context.Context, rawURL string, opts FetchOptions, r
 				return nil, fmt.Errorf("fetch: read chunk body: %w", err)
 			}
 
-			// Read trailing CRLF
-			_, _ = reader.ReadString('\n')
+			// Read trailing CRLF (bounded)
+			_, _ = readBoundedLine(reader, maxHTTPHeaderLineBytes)
 
 			if time.Since(lastProgress) >= 100*time.Millisecond {
 				reportProgress(false)

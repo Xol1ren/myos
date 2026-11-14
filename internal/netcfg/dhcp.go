@@ -43,15 +43,17 @@ const (
 var magicCookie = []byte{0x63, 0x82, 0x53, 0x63}
 
 func buildPacket(mac net.HardwareAddr, xid uint32, msgType byte, reqIP, server net.IP) []byte {
+	var hw [6]byte
+	copy(hw[:], mac)
 	p := make([]byte, 240, 300)
 	p[0], p[1], p[2] = 1, 1, 6 // BOOTREQUEST, ethernet, hlen
 	binary.BigEndian.PutUint32(p[4:8], xid)
 	binary.BigEndian.PutUint16(p[10:12], 0x8000) // ask for broadcast replies (we have no IP yet)
-	copy(p[28:44], mac)
+	copy(p[28:34], hw[:])
 	copy(p[236:240], magicCookie)
 	p = append(p, 53, 1, msgType)
 	p = append(p, 61, 7, 1)
-	p = append(p, mac...)
+	p = append(p, hw[:]...)
 	if reqIP != nil {
 		p = append(p, 50, 4)
 		p = append(p, reqIP.To4()...)
@@ -71,8 +73,8 @@ type reply struct {
 }
 
 func parseReply(p []byte, xid uint32, mac net.HardwareAddr) (*reply, error) {
-	if len(p) < 241 || p[0] != 2 || binary.BigEndian.Uint32(p[4:8]) != xid ||
-		!bytes.Equal(p[28:28+len(mac)], mac) || !bytes.Equal(p[236:240], magicCookie) {
+	if len(mac) != 6 || len(p) < 241 || p[0] != 2 || binary.BigEndian.Uint32(p[4:8]) != xid ||
+		!bytes.Equal(p[28:34], mac) || !bytes.Equal(p[236:240], magicCookie) {
 		return nil, errors.New("not our reply")
 	}
 	r := &reply{}
@@ -125,6 +127,9 @@ func parseReply(p []byte, xid uint32, mac net.HardwareAddr) (*reply, error) {
 // DHCP performs DISCOVER/OFFER/REQUEST/ACK on ifc without configuring it.
 // The UDP socket is bound to the device so it works before any IP exists.
 func DHCP(ifc *net.Interface, attempts int, logf func(string, ...any)) (*Lease, error) {
+	if ifc == nil || len(ifc.HardwareAddr) != 6 {
+		return nil, errors.New("dhcp: requires 6-byte Ethernet MAC address")
+	}
 	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
 		var serr error
 		if err := c.Control(func(fd uintptr) {

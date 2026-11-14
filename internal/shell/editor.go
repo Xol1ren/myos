@@ -11,6 +11,25 @@ import (
 	"myos/internal/sys"
 )
 
+const ioctlTIOCGWINSZ = 0x5413
+
+type ttyWinsize struct {
+	Row    uint16
+	Col    uint16
+	Xpixel uint16
+	Ypixel uint16
+}
+
+func termCols(fd int) int {
+	if fd >= 0 {
+		var ws ttyWinsize
+		if err := sys.Ioctl(fd, ioctlTIOCGWINSZ, unsafe.Pointer(&ws)); err == nil && ws.Col > 0 {
+			return int(ws.Col)
+		}
+	}
+	return 80
+}
+
 func isTTY(fd int) bool {
 	var t syscall.Termios
 	return sys.Ioctl(fd, syscall.TCGETS, unsafe.Pointer(&t)) == nil
@@ -36,11 +55,6 @@ func makeRaw(fd int) (func(), error) {
 // readLine reads one line with editing and history. It returns io.EOF-like
 // os.ErrClosed semantics via the eof flag when Ctrl-D is pressed on an empty line.
 func (s *Shell) readLine(prompt string) (line string, eof bool) {
-	out := s.outFile()
-	inFd := int(s.inFile().Fd())
-	if inFd >= 0 {
-		_ = syscall.SetNonblock(inFd, false)
-	}
 	if !s.tty {
 		l, err := s.stdin.ReadString('\n')
 		if err != nil && l == "" {
@@ -48,6 +62,8 @@ func (s *Shell) readLine(prompt string) (line string, eof bool) {
 		}
 		return strings.TrimRight(l, "\r\n"), false
 	}
+	out := s.outFile()
+	inFd := int(s.inFile().Fd())
 	restore, err := makeRaw(inFd)
 	if err != nil {
 		l, err := s.stdin.ReadString('\n')
@@ -64,10 +80,24 @@ func (s *Shell) readLine(prompt string) (line string, eof bool) {
 	saved := ""
 
 	redraw := func() {
+		cols := termCols(inFd)
+		promptLen := utf8.RuneCountInString(prompt)
+		maxEdit := cols - promptLen - 1
+		vis := buf
+		curCol := promptLen + pos
+		if maxEdit > 0 && len(buf) > maxEdit {
+			start := 0
+			if pos >= maxEdit {
+				start = pos - maxEdit + 1
+			}
+			end := min(start+maxEdit, len(buf))
+			vis = buf[start:end]
+			curCol = promptLen + (pos - start)
+		}
 		var sb strings.Builder
-		sb.WriteString("\r" + prompt + string(buf) + "\x1b[K\r")
-		if col := utf8.RuneCountInString(prompt) + pos; col > 0 {
-			fmt.Fprintf(&sb, "\x1b[%dC", col)
+		sb.WriteString("\r" + prompt + string(vis) + "\x1b[K\r")
+		if curCol > 0 {
+			fmt.Fprintf(&sb, "\x1b[%dC", curCol)
 		}
 		_, _ = out.WriteString(sb.String())
 	}
@@ -186,8 +216,11 @@ func (s *Shell) escape(buf *[]rune, pos, histIdx *int, saved *string, setLine fu
 		if err != nil {
 			return
 		}
-		if (c >= '0' && c <= '9') || c == ';' {
-			param = append(param, c)
+		// Consume ECMA-48 parameter bytes (0x30..0x3F) and intermediate bytes (0x20..0x2F)
+		if c >= 0x20 && c <= 0x3F {
+			if len(param) < 32 {
+				param = append(param, c)
+			}
 			continue
 		}
 		final = c

@@ -30,6 +30,7 @@ func TestParseMounts(t *testing.T) {
 	mountsFile := filepath.Join(tmp, "mounts")
 	data := `/dev/sda1 /boot ext4 rw,relatime 0 0
 /dev/sda2 / ext4 rw,relatime 0 0
+/dev/sdb1 /mnt/usb\040drive vfat rw 0 0
 tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
 `
 	if err := os.WriteFile(mountsFile, []byte(data), 0644); err != nil {
@@ -46,6 +47,9 @@ tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
 	}
 	if m, ok := mounts["/dev/sda2"]; !ok || m.Mount != "/" || m.FSType != "ext4" {
 		t.Errorf("expected /dev/sda2 mounted at / ext4, got %+v", m)
+	}
+	if m, ok := mounts["/dev/sdb1"]; !ok || m.Mount != "/mnt/usb drive" || m.FSType != "vfat" {
+		t.Errorf("expected /dev/sdb1 mounted at '/mnt/usb drive' vfat, got %+v", m)
 	}
 }
 

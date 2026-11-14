@@ -192,13 +192,16 @@ func TestModeSelection(t *testing.T) {
 func TestCRTCSelection(t *testing.T) {
 	crtcs := []uint32{10, 20, 30}
 	// Empty CRTC list
-	if id := selectCRTC(0, &drmGetConnector{}, nil); id != 0 {
+	if id := selectCRTC(0, drmGetConnector{}, nil); id != 0 {
 		t.Fatalf("expected 0 for empty CRTCs, got %d", id)
 	}
-	// Default to first CRTC when no encoder bound
-	conn := &drmGetConnector{}
+	// Default to first CRTC when no encoder bound, without mutating caller's connector
+	conn := drmGetConnector{countModes: 3}
 	if id := selectCRTC(0, conn, crtcs); id != 10 {
 		t.Fatalf("expected default CRTC 10, got %d", id)
+	}
+	if conn.countModes != 3 {
+		t.Fatalf("selectCRTC mutated caller's connector countModes: %d", conn.countModes)
 	}
 }
 
@@ -208,12 +211,12 @@ type mockDevice struct {
 	closed bool
 }
 
-func (m *mockDevice) Width() int           { return m.Canvas.W }
-func (m *mockDevice) Height() int          { return m.Canvas.H }
-func (m *mockDevice) Surface() *Canvas     { return &m.Canvas }
-func (m *mockDevice) Blit()                { m.blits++ }
-func (m *mockDevice) Close() error         { m.closed = true; return nil }
-func (m *mockDevice) Backend() string      { return "MockDevice (100x100)" }
+func (m *mockDevice) Width() int       { return m.Canvas.W }
+func (m *mockDevice) Height() int      { return m.Canvas.H }
+func (m *mockDevice) Surface() *Canvas { return &m.Canvas }
+func (m *mockDevice) Blit()            { m.blits++ }
+func (m *mockDevice) Close() error     { m.closed = true; return nil }
+func (m *mockDevice) Backend() string  { return "MockDevice (100x100)" }
 
 func TestDeviceInterface(t *testing.T) {
 	// Ensure *Framebuffer and *DRMDevice implement Device
@@ -587,5 +590,16 @@ func TestKeyboardListenerPollTimeoutAndDrain(t *testing.T) {
 	buf, ok, eof = l.Poll(10 * time.Millisecond)
 	if !eof {
 		t.Fatalf("expected eof=true on closed listener, got ok=%v, eof=%v, buf=%v", ok, eof, buf)
+	}
+
+	// Verify that after Close(), no leaked goroutine steals subsequent bytes written to p1w
+	if _, err := p1w.Write([]byte("post-close")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	var postBuf [16]byte
+	n, err := p1r.Read(postBuf[:])
+	if err != nil || string(postBuf[:n]) != "post-close" {
+		t.Fatalf("expected 'post-close' to remain intact on primaryFd after Close(), got %q (err=%v)", string(postBuf[:n]), err)
 	}
 }

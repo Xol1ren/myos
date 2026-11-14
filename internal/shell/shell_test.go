@@ -318,3 +318,19 @@ func TestPollDualBytes(t *testing.T) {
 		t.Fatalf("expected 'input2', got ok=%v, eof=%v, buf=%q", ok, eof, string(buf))
 	}
 }
+
+func TestPipelineConcurrentEnvIsolation(t *testing.T) {
+	s := New(nil)
+	t.Setenv("HOME", "/orig_home")
+	tmpOut := filepath.Join(t.TempDir(), "pipe_env.txt")
+	stages, err := parse("HOME=/stage1 echo a | HOME=/stage2 cat > "+tmpOut, s.lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := s.execute(stages); code != 0 {
+		t.Fatalf("pipeline failed with code %d", code)
+	}
+	if got := os.Getenv("HOME"); got != "/orig_home" {
+		t.Fatalf("expected global HOME to remain /orig_home, got %q", got)
+	}
+}

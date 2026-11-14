@@ -87,6 +87,12 @@ func (d *DRMDevice) Close() error {
 			d.origCRTC.setConnectorsPtr = uint64(uintptr(unsafe.Pointer(&connID)))
 			d.origCRTC.countConnectors = 1
 			_ = sys.Ioctl(d.fd, drmIoctlModeSetCRTC, unsafe.Pointer(&d.origCRTC))
+		} else {
+			// Clear scanout buffer before teardown so the screen never stays frozen on the last frame
+			clear(d.mem)
+			var dirty drmFBDirtyCmd
+			dirty.fbID = d.fbID
+			_ = sys.Ioctl(d.fd, drmIoctlModeDirtyFB, unsafe.Pointer(&dirty))
 		}
 		d.hw32 = nil
 		if err := syscall.Munmap(d.mem); err != nil && firstErr == nil {
@@ -175,34 +181,53 @@ func openDRMCard(path string) (*DRMDevice, error) {
 		return nil, fmt.Errorf("device %s does not support dumb buffers", path)
 	}
 
-	// 1. Query resources count
-	var res drmCardRes
-	if err := sys.Ioctl(fd, drmIoctlModeGetResources, unsafe.Pointer(&res)); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("DRM_IOCTL_MODE_GETRESOURCES: %w", err)
-	}
-	if res.countConnectors == 0 || res.countCRTCs == 0 {
-		f.Close()
-		return nil, fmt.Errorf("DRM device %s has %d connectors and %d CRTCs", path, res.countConnectors, res.countCRTCs)
-	}
+	// 1 & 2. Query resources count and fetch full lists (retry if hotplug grows counts)
+	var (
+		res     drmCardRes
+		fbIDs   []uint32
+		crtcIDs []uint32
+		connIDs []uint32
+		encIDs  []uint32
+	)
+	for attempt := 0; attempt < 4; attempt++ {
+		res = drmCardRes{}
+		if err := sys.Ioctl(fd, drmIoctlModeGetResources, unsafe.Pointer(&res)); err != nil {
+			_ = sys.Ioctl(fd, drmIoctlDropMaster, nil)
+			f.Close()
+			return nil, fmt.Errorf("DRM_IOCTL_MODE_GETRESOURCES: %w", err)
+		}
+		if res.countConnectors == 0 || res.countCRTCs == 0 {
+			_ = sys.Ioctl(fd, drmIoctlDropMaster, nil)
+			f.Close()
+			return nil, fmt.Errorf("DRM device %s has %d connectors and %d CRTCs", path, res.countConnectors, res.countCRTCs)
+		}
 
-	// 2. Fetch full resources lists
-	fbIDs := make([]uint32, res.countFBs)
-	crtcIDs := make([]uint32, res.countCRTCs)
-	connIDs := make([]uint32, res.countConnectors)
-	encIDs := make([]uint32, res.countEncoders)
+		nFB, nCRTC, nConn, nEnc := res.countFBs, res.countCRTCs, res.countConnectors, res.countEncoders
+		fbIDs = make([]uint32, nFB)
+		crtcIDs = make([]uint32, nCRTC)
+		connIDs = make([]uint32, nConn)
+		encIDs = make([]uint32, nEnc)
 
-	if len(fbIDs) > 0 {
-		res.fbIDPtr = uint64(uintptr(unsafe.Pointer(&fbIDs[0])))
-	}
-	res.crtcIDPtr = uint64(uintptr(unsafe.Pointer(&crtcIDs[0])))
-	res.connectorIDPtr = uint64(uintptr(unsafe.Pointer(&connIDs[0])))
-	if len(encIDs) > 0 {
-		res.encoderIDPtr = uint64(uintptr(unsafe.Pointer(&encIDs[0])))
-	}
-	if err := sys.Ioctl(fd, drmIoctlModeGetResources, unsafe.Pointer(&res)); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("DRM_IOCTL_MODE_GETRESOURCES data: %w", err)
+		if len(fbIDs) > 0 {
+			res.fbIDPtr = uint64(uintptr(unsafe.Pointer(&fbIDs[0])))
+		}
+		res.crtcIDPtr = uint64(uintptr(unsafe.Pointer(&crtcIDs[0])))
+		res.connectorIDPtr = uint64(uintptr(unsafe.Pointer(&connIDs[0])))
+		if len(encIDs) > 0 {
+			res.encoderIDPtr = uint64(uintptr(unsafe.Pointer(&encIDs[0])))
+		}
+		if err := sys.Ioctl(fd, drmIoctlModeGetResources, unsafe.Pointer(&res)); err != nil {
+			_ = sys.Ioctl(fd, drmIoctlDropMaster, nil)
+			f.Close()
+			return nil, fmt.Errorf("DRM_IOCTL_MODE_GETRESOURCES data: %w", err)
+		}
+		if res.countFBs <= nFB && res.countCRTCs <= nCRTC && res.countConnectors <= nConn && res.countEncoders <= nEnc {
+			fbIDs = fbIDs[:res.countFBs]
+			crtcIDs = crtcIDs[:res.countCRTCs]
+			connIDs = connIDs[:res.countConnectors]
+			encIDs = encIDs[:res.countEncoders]
+			break
+		}
 	}
 
 	// 3. Find an active/connected connector
@@ -265,16 +290,25 @@ func openDRMCard(path string) (*DRMDevice, error) {
 		return nil, fmt.Errorf("invalid mode resolution %dx%d", w, h)
 	}
 
-	// 5. Select CRTC
-	targetCRTCID := selectCRTC(fd, &selectedConn, crtcIDs)
+	// 5. Select CRTC (passing selectedConn by value so its fields are not mutated)
+	targetCRTCID := selectCRTC(fd, selectedConn, crtcIDs)
 	if targetCRTCID == 0 {
+		_ = sys.Ioctl(fd, drmIoctlDropMaster, nil)
 		f.Close()
 		return nil, fmt.Errorf("no usable CRTC found for connector %d", selectedConnID)
 	}
 
-	// Save original CRTC config if possible
+	// Save original CRTC bound to selectedConn's encoder (or targetCRTCID) if possible
+	origCRTCID := targetCRTCID
+	if selectedConn.encoderID != 0 {
+		var enc drmGetEncoder
+		enc.encoderID = selectedConn.encoderID
+		if err := sys.Ioctl(fd, drmIoctlModeGetEncoder, unsafe.Pointer(&enc)); err == nil && enc.crtcID != 0 {
+			origCRTCID = enc.crtcID
+		}
+	}
 	var origCRTC drmCRTC
-	origCRTC.crtcID = targetCRTCID
+	origCRTC.crtcID = origCRTCID
 	hasOrigCRTC := false
 	if err := sys.Ioctl(fd, drmIoctlModeGetCRTC, unsafe.Pointer(&origCRTC)); err == nil {
 		hasOrigCRTC = true
@@ -406,8 +440,8 @@ func selectBestMode(modes []drmModeInfo) drmModeInfo {
 	return modes[0]
 }
 
-// selectCRTC resolves a CRTC ID for the chosen connector.
-func selectCRTC(fd int, conn *drmGetConnector, crtcIDs []uint32) uint32 {
+// selectCRTC resolves a CRTC ID for the chosen connector (receives conn by value to preserve caller's struct).
+func selectCRTC(fd int, conn drmGetConnector, crtcIDs []uint32) uint32 {
 	if len(crtcIDs) == 0 {
 		return 0
 	}
@@ -435,7 +469,7 @@ func selectCRTC(fd int, conn *drmGetConnector, crtcIDs []uint32) uint32 {
 		conn.countProps = 0
 		conn.propsPtr = 0
 		conn.propValuesPtr = 0
-		if err := sys.Ioctl(fd, drmIoctlModeGetConnector, unsafe.Pointer(conn)); err == nil {
+		if err := sys.Ioctl(fd, drmIoctlModeGetConnector, unsafe.Pointer(&conn)); err == nil {
 			for _, eid := range encs {
 				var enc drmGetEncoder
 				enc.encoderID = eid

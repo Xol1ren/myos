@@ -13,10 +13,11 @@ import (
 )
 
 var (
-	mu        sync.Mutex
-	startOnce sync.Once
-	waiters   = map[int]chan syscall.WaitStatus{}
-	exited    = map[int]syscall.WaitStatus{} // reaped before Wait was called
+	mu         sync.Mutex
+	startOnce  sync.Once
+	registered = map[int]bool{}
+	waiters    = map[int]chan syscall.WaitStatus{}
+	exited     = map[int]syscall.WaitStatus{} // reaped before Wait was called
 )
 
 // StartReaper reaps every terminated child on SIGCHLD (plus a 1s safety tick
@@ -52,14 +53,9 @@ func reap() {
 		mu.Lock()
 		if c, ok := waiters[pid]; ok {
 			delete(waiters, pid)
+			delete(registered, pid)
 			c <- ws // buffered
-		} else {
-			if len(exited) > 1024 { // orphans nobody will claim
-				for k := range exited {
-					delete(exited, k)
-					break
-				}
-			}
+		} else if registered[pid] {
 			exited[pid] = ws
 		}
 		mu.Unlock()
@@ -68,12 +64,29 @@ func reap() {
 
 // Spawn starts path with argv and the given stdio file descriptors.
 func Spawn(path string, argv, env []string, files []uintptr) (int, error) {
-	StartReaper()
-	dir, _ := os.Getwd()
-	return syscall.ForkExec(path, argv, &syscall.ProcAttr{Dir: dir, Env: env, Files: files})
+	return SpawnAttr(path, argv, env, files, nil)
 }
 
-// Wait blocks until the child pid (started by Spawn) exits.
+// SpawnAttr starts path with argv, stdio file descriptors, and optional SysProcAttr.
+// The child PID is atomically registered with the reaper before ForkExec unlocks.
+func SpawnAttr(path string, argv, env []string, files []uintptr, sys *syscall.SysProcAttr) (int, error) {
+	StartReaper()
+	dir, _ := os.Getwd()
+	mu.Lock()
+	pid, err := syscall.ForkExec(path, argv, &syscall.ProcAttr{
+		Dir:   dir,
+		Env:   env,
+		Files: files,
+		Sys:   sys,
+	})
+	if err == nil && pid > 0 {
+		registered[pid] = true
+	}
+	mu.Unlock()
+	return pid, err
+}
+
+// Wait blocks until the child pid (started by Spawn/SpawnAttr) exits.
 func Wait(pid int) syscall.WaitStatus {
 	if pid <= 0 {
 		return 0
@@ -82,6 +95,7 @@ func Wait(pid int) syscall.WaitStatus {
 	mu.Lock()
 	if ws, ok := exited[pid]; ok {
 		delete(exited, pid)
+		delete(registered, pid)
 		mu.Unlock()
 		return ws
 	}

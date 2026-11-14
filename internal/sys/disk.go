@@ -34,6 +34,29 @@ type MountEntry struct {
 	FSType string
 }
 
+// unescapeMountPath decodes octal escape sequences (e.g. \040 for space, \011 for tab)
+// used by the Linux kernel in /proc/mounts.
+func unescapeMountPath(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) &&
+			s[i+1] >= '0' && s[i+1] <= '7' &&
+			s[i+2] >= '0' && s[i+2] <= '7' &&
+			s[i+3] >= '0' && s[i+3] <= '7' {
+			val := (s[i+1]-'0')*64 + (s[i+2]-'0')*8 + (s[i+3] - '0')
+			b.WriteByte(val)
+			i += 3
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
 // ParseMounts parses /proc/mounts (or an equivalent file) into a device-to-mount map.
 func ParseMounts(mountsPath string) (map[string]MountEntry, error) {
 	f, err := os.Open(mountsPath)
@@ -47,10 +70,10 @@ func ParseMounts(mountsPath string) (map[string]MountEntry, error) {
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
 		if len(fields) >= 3 {
-			dev := fields[0]
+			dev := unescapeMountPath(fields[0])
 			mounts[dev] = MountEntry{
 				Device: dev,
-				Mount:  fields[1],
+				Mount:  unescapeMountPath(fields[1]),
 				FSType: fields[2],
 			}
 		}
@@ -61,7 +84,7 @@ func ParseMounts(mountsPath string) (map[string]MountEntry, error) {
 // FormatBytes formats a byte count into a human-readable string (e.g. 512.0M, 10.0G).
 func FormatBytes(b uint64) string {
 	const (
-		_   = 1 << (10 * iota)
+		_ = 1 << (10 * iota)
 		kib
 		mib
 		gib

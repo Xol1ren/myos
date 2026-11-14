@@ -4,12 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
+	"unicode/utf8"
 	"unsafe"
+
+	"myos/internal/proc"
 )
 
 const (
@@ -27,7 +30,7 @@ type Winsize struct {
 }
 
 type Cell struct {
-	Ch byte
+	Ch rune
 	Fg Color
 	Bg Color
 }
@@ -62,7 +65,7 @@ type Terminal struct {
 	mu       sync.Mutex
 	master   *os.File
 	slave    *os.File
-	cmd      *exec.Cmd
+	childPid int
 	rows     int
 	cols     int
 	grid     [][]Cell
@@ -75,10 +78,13 @@ type Terminal struct {
 	title    string
 	slaveDev string
 
-	// ANSI parser state
+	// ANSI & UTF-8 parser state
 	inEsc  bool
 	inCSI  bool
+	inOSC  bool
 	csiBuf []byte
+	utfBuf [4]byte
+	utfLen int
 	curFg  Color
 	curBg  Color
 }
@@ -192,8 +198,14 @@ func (t *Terminal) startProcess() {
 	// In unit test runner binary, don't re-exec the test harness; use worker if available
 	if strings.HasSuffix(self, ".test") {
 		if ShellWorker != nil {
+			slave := t.slave
+			t.slave = nil
 			go func() {
-				ShellWorker(t.slave)
+				defer func() {
+					time.Sleep(15 * time.Millisecond)
+					_ = slave.Close()
+				}()
+				ShellWorker(slave)
 				t.mu.Lock()
 				t.active = false
 				t.mu.Unlock()
@@ -202,32 +214,39 @@ func (t *Terminal) startProcess() {
 		return
 	}
 
-	cmd := exec.Command(self, "-shell")
-	cmd.Stdin = t.slave
-	cmd.Stdout = t.slave
-	cmd.Stderr = t.slave
-	cmd.Env = append(os.Environ(),
+	env := append(os.Environ(),
 		"TERM=linux",
 		fmt.Sprintf("LINES=%d", t.rows),
 		fmt.Sprintf("COLUMNS=%d", t.cols),
 	)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
+	sysAttr := &syscall.SysProcAttr{
 		Setsid:  true,
 		Setctty: true,
 		Ctty:    0, // Child's stdin file descriptor index (0), NOT parent's slave.Fd()!
 	}
-
-	if err := cmd.Start(); err != nil {
+	slaveFd := t.slave.Fd()
+	pid, err := proc.SpawnAttr(self, []string{self, "-shell"}, env, []uintptr{slaveFd, slaveFd, slaveFd}, sysAttr)
+	if err != nil {
 		_, _ = t.WriteString(fmt.Sprintf("\r\n[terminal] exec %s -shell: %v\r\n", self, err))
 		if ShellWorker != nil {
 			_, _ = t.WriteString("[terminal] starting internal shell worker...\r\n")
+			slave := t.slave
+			t.slave = nil
 			go func() {
-				ShellWorker(t.slave)
+				defer func() {
+					time.Sleep(15 * time.Millisecond)
+					_ = slave.Close()
+				}()
+				ShellWorker(slave)
 				t.mu.Lock()
 				t.active = false
 				t.mu.Unlock()
 			}()
 		} else {
+			if t.slave != nil {
+				_ = t.slave.Close()
+				t.slave = nil
+			}
 			t.mu.Lock()
 			t.active = false
 			t.mu.Unlock()
@@ -235,13 +254,19 @@ func (t *Terminal) startProcess() {
 		return
 	}
 
-	t.cmd = cmd
-	go func() {
-		_ = cmd.Wait()
+	// Close parent's copy of slave FD immediately so master.Read receives EIO on child exit
+	if t.slave != nil {
+		_ = t.slave.Close()
+		t.slave = nil
+	}
+
+	t.childPid = pid
+	go func(pid int) {
+		_ = proc.Wait(pid)
 		t.mu.Lock()
 		t.active = false
 		t.mu.Unlock()
-	}()
+	}(pid)
 }
 
 func (t *Terminal) readLoop() {
@@ -279,7 +304,9 @@ func (t *Terminal) WriteString(s string) (int, error) {
 	return t.Write([]byte(s))
 }
 
-// Write parses ANSI escape sequences and writes printable characters into the grid buffer.
+const maxCSIBufLen = 64
+
+// Write parses ANSI escape sequences, decodes UTF-8 runes, and writes printable characters into the grid buffer.
 func (t *Terminal) Write(p []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -288,28 +315,72 @@ func (t *Terminal) Write(p []byte) (int, error) {
 	for i := 0; i < len(p); i++ {
 		b := p[i]
 
+		if t.inOSC {
+			if t.inEsc && b == '\\' { // ST (\x1b\\) terminates OSC
+				t.inOSC = false
+				t.inEsc = false
+				continue
+			}
+			if b == 7 { // BEL (\x07) terminates OSC
+				t.inOSC = false
+				t.inEsc = false
+				continue
+			}
+			t.inEsc = (b == 27)
+			continue
+		}
+
 		if t.inCSI {
-			if b >= '0' && b <= '?' { // parameter bytes or intermediate
+			// ECMA-48 parameter bytes (0x30..0x3F) and intermediate bytes (0x20..0x2F)
+			if b >= 0x20 && b <= 0x3F {
+				if len(t.csiBuf) >= maxCSIBufLen {
+					// Cap CSI buffer to prevent unbounded allocation in PID 1
+					t.csiBuf = t.csiBuf[:0]
+					t.inCSI = false
+					t.inEsc = false
+					continue
+				}
 				t.csiBuf = append(t.csiBuf, b)
 				continue
 			}
-			// Final byte of CSI sequence
-			t.handleCSI(b)
+			// Final byte of CSI sequence (0x40..0x7E)
+			if b >= 0x40 && b <= 0x7E {
+				t.handleCSI(b)
+			}
 			t.inCSI = false
 			t.inEsc = false
 			continue
 		}
 
 		if t.inEsc {
-			if b == '[' {
+			switch b {
+			case '[':
 				t.inCSI = true
 				t.csiBuf = t.csiBuf[:0]
-				continue
+			case ']':
+				t.inOSC = true
+				t.inEsc = false
+			default:
+				// Unhandled two-byte escape sequence
+				t.inEsc = false
 			}
-			// Unhandled two-byte escape sequence
-			t.inEsc = false
 			continue
 		}
+
+		if b >= 0x80 {
+			t.utfBuf[t.utfLen] = b
+			t.utfLen++
+			if utf8.FullRune(t.utfBuf[:t.utfLen]) {
+				r, _ := utf8.DecodeRune(t.utfBuf[:t.utfLen])
+				t.utfLen = 0
+				t.putRune(r)
+			} else if t.utfLen >= len(t.utfBuf) {
+				t.utfLen = 0
+				t.putRune(utf8.RuneError)
+			}
+			continue
+		}
+		t.utfLen = 0
 
 		switch b {
 		case 27: // ESC
@@ -335,21 +406,25 @@ func (t *Terminal) Write(p []byte) (int, error) {
 		case '\a': // Bell - swallow
 		default:
 			if b >= 32 {
-				if t.curX >= t.cols {
-					t.curX = 0
-					t.curY++
-					if t.curY >= t.rows {
-						t.scrollUp()
-					}
-				}
-				if t.curY >= 0 && t.curY < t.rows && t.curX >= 0 && t.curX < t.cols {
-					t.grid[t.curY][t.curX] = Cell{Ch: b, Fg: t.curFg, Bg: t.curBg}
-				}
-				t.curX++
+				t.putRune(rune(b))
 			}
 		}
 	}
 	return len(p), nil
+}
+
+func (t *Terminal) putRune(r rune) {
+	if t.curX >= t.cols {
+		t.curX = 0
+		t.curY++
+		if t.curY >= t.rows {
+			t.scrollUp()
+		}
+	}
+	if t.curY >= 0 && t.curY < t.rows && t.curX >= 0 && t.curX < t.cols {
+		t.grid[t.curY][t.curX] = Cell{Ch: r, Fg: t.curFg, Bg: t.curBg}
+	}
+	t.curX++
 }
 
 func (t *Terminal) scrollUp() {
@@ -364,6 +439,12 @@ func (t *Terminal) scrollUp() {
 }
 
 func (t *Terminal) handleCSI(final byte) {
+	// Ignore private/intermediate sequences that have intermediate bytes (0x20..0x2F)
+	for _, b := range t.csiBuf {
+		if b >= 0x20 && b <= 0x2F {
+			return
+		}
+	}
 	params := string(t.csiBuf)
 	args := parseCSIArgs(params)
 
@@ -527,7 +608,11 @@ func (t *Terminal) Draw(c *Canvas, winX, winY, winW, winH int, focused bool) {
 				c.DrawFillRect(colX, rowY, GlyphW, GlyphH, cell.Bg)
 			}
 			if cell.Ch > 32 {
-				c.DrawGlyph(colX, rowY, cell.Ch, cell.Fg)
+				ch := byte('?')
+				if cell.Ch <= 126 {
+					ch = byte(cell.Ch)
+				}
+				c.DrawGlyph(colX, rowY, ch, cell.Fg)
 			}
 		}
 	}
@@ -541,7 +626,11 @@ func (t *Terminal) Draw(c *Canvas, winX, winY, winW, winH int, focused bool) {
 				c.DrawFillRect(cursorX, cursorY, GlyphW, GlyphH, termCursorCol)
 				curCell := t.grid[t.curY][t.curX]
 				if curCell.Ch > 32 {
-					c.DrawGlyph(cursorX, cursorY, curCell.Ch, 0x000000)
+					ch := byte('?')
+					if curCell.Ch <= 126 {
+						ch = byte(curCell.Ch)
+					}
+					c.DrawGlyph(cursorX, cursorY, ch, 0x000000)
 				}
 			} else {
 				c.DrawRect(cursorX, cursorY, GlyphW, GlyphH, termCursorCol)
@@ -573,8 +662,8 @@ func (t *Terminal) Close() error {
 	}
 	t.closed = true
 	t.active = false
-	if t.cmd != nil && t.cmd.Process != nil {
-		_ = t.cmd.Process.Kill()
+	if t.childPid > 0 {
+		_ = syscall.Kill(t.childPid, syscall.SIGKILL)
 	}
 	if t.master != nil {
 		_ = t.master.Close()

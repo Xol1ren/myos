@@ -106,7 +106,6 @@ func runShell(m *input.Mouse) {
 			logf("shell panic: %v", r)
 		}
 	}()
-	_ = syscall.SetNonblock(int(os.Stdin.Fd()), false)
 	shell.New(m).Run()
 }
 
@@ -117,10 +116,23 @@ func bringUpNetwork() {
 		return
 	}
 	logf("net: using %s (%s)", ifc.Name, ifc.HardwareAddr)
-	lease, err := netcfg.Configure(ifc, logf)
-	if err != nil {
-		logf("net: %v", err)
-		return
+	for {
+		lease, err := netcfg.Configure(ifc, logf)
+		if err != nil {
+			logf("net: %v", err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+		logf("net: %s leased %s/%d gw %v dns %v", ifc.Name, lease.IP, lease.PrefixLen(), lease.Router, lease.DNS)
+		// Renew at T1 (50% of lease time; default to 30m if server omitted option 51)
+		t1 := lease.Time / 2
+		if t1 < 30*time.Second {
+			if lease.Time <= 0 {
+				t1 = 30 * time.Minute
+			} else {
+				t1 = 30 * time.Second
+			}
+		}
+		time.Sleep(t1)
 	}
-	logf("net: %s leased %s/%d gw %v dns %v", ifc.Name, lease.IP, lease.PrefixLen(), lease.Router, lease.DNS)
 }

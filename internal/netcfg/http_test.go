@@ -158,3 +158,27 @@ func TestFetchInvalidHost(t *testing.T) {
 		t.Error("expected error for unreachable port, got nil")
 	}
 }
+
+func TestFetchHTTPErrorDoesNotOverwriteFile(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Not Found Page", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	tmp := t.TempDir()
+	outPath := filepath.Join(tmp, "should_not_exist.txt")
+
+	res, err := Fetch(context.Background(), ts.URL+"/missing", FetchOptions{
+		Timeout: 5 * time.Second,
+		OutPath: outPath,
+	})
+	if err == nil {
+		t.Fatal("expected error for HTTP 404, got nil")
+	}
+	if res == nil || res.StatusCode != 404 {
+		t.Fatalf("expected status 404 in result, got %+v", res)
+	}
+	if _, statErr := os.Stat(outPath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected output file not to be created on 404, stat err: %v", statErr)
+	}
+}

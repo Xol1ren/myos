@@ -153,13 +153,41 @@ func CmdlineValue(key string) string {
 	return ParseCmdline(string(b))[key]
 }
 
-// AttachConsole opens path (default /dev/console) and makes it stdin,
-// stdout and stderr.
+// ResolveConsoleDevice resolves /dev/console (which cannot act as a controlling
+// terminal in the Linux kernel) to the underlying active TTY device listed in
+// /sys/class/tty/console/active (e.g. /dev/ttyS0 or /dev/tty1).
+func ResolveConsoleDevice(activeData string) string {
+	fields := strings.Fields(activeData)
+	if len(fields) == 0 {
+		return "/dev/console"
+	}
+	last := fields[len(fields)-1]
+	if strings.HasPrefix(last, "/dev/") {
+		return last
+	}
+	return "/dev/" + last
+}
+
+// AttachConsole opens path (defaulting to the active underlying console device
+// from /sys/class/tty/console/active or /dev/console), makes it stdin, stdout,
+// and stderr, and acquires it as the controlling terminal (TIOCSCTTY).
 func AttachConsole(path string) error {
-	if path == "" {
-		path = "/dev/console"
+	useDefault := path == "" || path == "/dev/console"
+	if useDefault {
+		if b, err := os.ReadFile("/sys/class/tty/console/active"); err == nil {
+			cand := ResolveConsoleDevice(string(b))
+			if _, err := os.Stat(cand); err == nil {
+				path = cand
+			}
+		}
+		if path == "" {
+			path = "/dev/console"
+		}
 	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil && useDefault && path != "/dev/console" {
+		f, err = os.OpenFile("/dev/console", os.O_RDWR, 0)
+	}
 	if err != nil {
 		return err
 	}
@@ -189,9 +217,8 @@ func AttachConsole(path string) error {
 	if needClose {
 		syscall.Close(srcFd)
 	}
-	os.Stdin = os.NewFile(0, "/dev/stdin")
-	os.Stdout = os.NewFile(1, "/dev/stdout")
-	os.Stderr = os.NewFile(2, "/dev/stderr")
+	_, _, _ = syscall.Syscall(syscall.SYS_SETSID, 0, 0, 0)
+	_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, 0, uintptr(syscall.TIOCSCTTY), 1)
 	return nil
 }
 
