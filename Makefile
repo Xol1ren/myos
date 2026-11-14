@@ -5,7 +5,7 @@ KVER     ?= $(shell uname -r)
 KERNEL   ?= $(firstword $(wildcard /boot/vmlinuz-$(KVER) /usr/lib/modules/$(KVER)/vmlinuz /lib/modules/$(KVER)/vmlinuz /boot/vmlinuz))
 # Kernel modules to stage into the initramfs (needed when the kernel builds
 # drivers as modules, e.g. distro kernels). Use MODULES= to disable.
-MODULES  ?= e1000 ehci_pci usbhid hid_generic mousedev evdev atkbd psmouse simpledrm bochs
+MODULES  ?= e1000 ehci_pci usbhid hid_generic mousedev evdev atkbd psmouse simpledrm bochs ext4 crc16 mbcache jbd2 virtio_blk
 # Set NOGRAPHIC=1 to run on the serial console in the current terminal.
 NOGRAPHIC ?=
 MEM      ?= 512M
@@ -55,11 +55,19 @@ $(INITRAMFS): $(INIT_BIN) scripts/mkmodules.sh Makefile
 	cd $(ROOTFS) && find . | cpio -o -H newc --owner=0:0 --quiet | gzip -9 > ../initramfs.cpio.gz
 	@ls -lh $(INITRAMFS)
 
-run: build
+DISK_IMG := $(BUILD)/disk.img
+
+$(DISK_IMG):
+	@mkdir -p $(BUILD)
+	truncate -s 64M $(DISK_IMG)
+	@if command -v mkfs.ext4 >/dev/null 2>&1; then mkfs.ext4 -F -q $(DISK_IMG); fi
+
+run: build $(DISK_IMG)
 	@test -n "$(KERNEL)" -a -r "$(KERNEL)" || { echo "error: no readable kernel found; pass KERNEL=/path/to/vmlinuz" >&2; exit 1; }
 	$(QEMU) $(ACCEL) -m $(MEM) -smp 2 \
 		-kernel $(KERNEL) -initrd $(INITRAMFS) \
 		-append "$(CMDLINE_TTY) quiet loglevel=3 rdinit=/init mousedev.xres=1280 mousedev.yres=800" \
+		-drive file=$(DISK_IMG),format=raw,if=virtio \
 		-net nic,model=e1000 -net user \
 		$(QEMU_MOUSE) \
 		$(DISPLAY_ARGS)

@@ -62,6 +62,9 @@ func init() {
 		"gui":      biGui,
 		"disks":    biDisks,
 		"fetch":    biFetch,
+		"mount":    biMount,
+		"umount":   biUmount,
+		"edit":     biEdit,
 	}
 }
 
@@ -674,5 +677,43 @@ func biFetch(_ *Shell, io *IO, args []string) int {
 	}
 	fmt.Fprintf(io.Err, "downloaded %d bytes in %v (%s/s) -> %s (HTTP %d %s)\n",
 		res.BytesRead, res.Duration.Round(time.Millisecond), sys.FormatBytes(uint64(rate)), dest, res.StatusCode, res.StatusText)
+	return 0
+}
+
+func biMount(_ *Shell, io *IO, args []string) int {
+	var fstype string
+	var pos []string
+	for i := 1; i < len(args); i++ {
+		if args[i] == "-t" {
+			if i+1 >= len(args) {
+				fmt.Fprintln(io.Err, "usage: mount [-t fstype] <device> <target>")
+				return 1
+			}
+			fstype = args[i+1]
+			i++
+		} else {
+			pos = append(pos, args[i])
+		}
+	}
+	if len(pos) != 2 {
+		fmt.Fprintln(io.Err, "usage: mount [-t fstype] <device> <target>")
+		return 1
+	}
+	if err := sys.MountAuto(pos[0], pos[1], fstype); err != nil {
+		fmt.Fprintf(io.Err, "mount: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func biUmount(_ *Shell, io *IO, args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(io.Err, "usage: umount <target>")
+		return 1
+	}
+	if err := sys.Umount(args[1]); err != nil {
+		fmt.Fprintf(io.Err, "umount: %v\n", err)
+		return 1
+	}
 	return 0
 }
