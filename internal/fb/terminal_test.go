@@ -31,7 +31,7 @@ func TestTerminalGridAndANSI(t *testing.T) {
 		t.Errorf("expected cursor at (0, 1), got (%d, %d)", term.curX, term.curY)
 	}
 	for i, ch := range "Hello MYOS" {
-		if term.grid[0][i].Ch != byte(ch) {
+		if term.grid[0][i].Ch != ch {
 			t.Errorf("grid[0][%d] = %c, want %c", i, term.grid[0][i].Ch, ch)
 		}
 	}
@@ -154,7 +154,7 @@ func TestTerminalInProcessShellWorker(t *testing.T) {
 	foundWorker := false
 	term.mu.Lock()
 	for r := 0; r < term.rows; r++ {
-		var row []byte
+		var row []rune
 		for c := 0; c < term.cols; c++ {
 			row = append(row, term.grid[r][c].Ch)
 		}
@@ -211,11 +211,43 @@ func TestTerminalWriteString(t *testing.T) {
 	}
 
 	_, _ = term.WriteString("DirectString\n")
-	var row []byte
+	var row []rune
 	for c := 0; c < 20; c++ {
 		row = append(row, term.grid[0][c].Ch)
 	}
 	if !strings.Contains(string(row), "DirectString") {
 		t.Errorf("expected DirectString in row 0, got %q", string(row))
+	}
+}
+
+func TestTerminalCSIBoundsOSCAndUTF8(t *testing.T) {
+	term := &Terminal{
+		rows:   5,
+		cols:   20,
+		curVis: true,
+		curFg:  termDefaultFg,
+		curBg:  termDefaultBg,
+		csiBuf: make([]byte, 0, 32),
+		title:  "Bounds Term",
+	}
+	term.grid = make([][]Cell, 5)
+	for r := 0; r < 5; r++ {
+		term.grid[r] = make([]Cell, 20)
+		for c := 0; c < 20; c++ {
+			term.grid[r][c] = Cell{Ch: ' ', Fg: termDefaultFg, Bg: termDefaultBg}
+		}
+	}
+
+	// 1. Overlong CSI sequence (>64 bytes) must be capped and aborted safely
+	longCSI := "\x1b[" + strings.Repeat("0", 200) + "m"
+	_, _ = term.WriteString(longCSI)
+	if len(term.csiBuf) > maxCSIBufLen {
+		t.Fatalf("csiBuf exceeded maxCSIBufLen: %d", len(term.csiBuf))
+	}
+
+	// 2. OSC sequence (\x1b]0;WindowTitle\x07) and intermediate CSI (\x1b[0 q) must not print to grid
+	_, _ = term.Write([]byte("\x1b[2J\x1b]0;SecretTitle\x07\x1b[0 qA→B"))
+	if term.grid[0][0].Ch != 'A' || term.grid[0][1].Ch != '→' || term.grid[0][2].Ch != 'B' {
+		t.Fatalf("expected 'A→B' in grid[0][0..2], got %q %q %q", term.grid[0][0].Ch, term.grid[0][1].Ch, term.grid[0][2].Ch)
 	}
 }

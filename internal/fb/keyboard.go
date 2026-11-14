@@ -1,7 +1,6 @@
 package fb
 
 import (
-	"os"
 	"sync"
 	"syscall"
 	"time"
@@ -11,41 +10,44 @@ import (
 )
 
 // KeyboardListener multiplexes keyboard input from both the primary console
-// (typically os.Stdin / serial console) and secondary virtual terminals
-// (/dev/tty0, /dev/tty1 for QEMU graphical window focus).
-// Dedicated reader goroutines block on read() and push incoming bytes to keyChan.
+// (typically fd 0 / serial console) and secondary virtual terminals
+// (/dev/tty0, /dev/tty1 for QEMU graphical window focus) using Linux epoll
+// and an eventfd shutdown descriptor so Close() wakes the poller immediately
+// without leaking a reader goroutine or stealing bytes from fd 0.
 type KeyboardListener struct {
 	mu        sync.Mutex
 	primaryFd int
 	ttyFd     int
-	files     []*os.File
+	epfd      int
+	wakeFd    int
+	ownedFds  []int
 	restores  []func()
 	keyChan   chan byte
 	done      chan struct{}
+	loopDone  chan struct{}
 	closed    bool
 }
 
-// OpenDualKeyboard opens /dev/tty0 and /dev/tty1 (if available) alongside os.Stdin (fd 0).
+// OpenDualKeyboard opens /dev/tty0 and /dev/tty1 (if available) alongside stdin (fd 0).
 func OpenDualKeyboard() (*KeyboardListener, error) {
-	return NewKeyboardListener(int(os.Stdin.Fd()), "/dev/tty0", "/dev/tty1")
+	return NewKeyboardListener(0, "/dev/tty0", "/dev/tty1")
 }
 
 // NewKeyboardListener initializes multiplexed keyboard input on primaryFd and secondaryPaths.
 // It configures raw termios without echo, hides the hardware cursor via ANSI escape sequences,
-// and spawns dedicated reader goroutines feeding into a buffered byte channel.
+// and starts a single epoll + eventfd multiplexer feeding into a buffered byte channel.
 func NewKeyboardListener(primaryFd int, secondaryPaths ...string) (*KeyboardListener, error) {
 	l := &KeyboardListener{
 		primaryFd: primaryFd,
 		ttyFd:     -1,
-		keyChan:   make(chan byte, 512),
-		done:      make(chan struct{}),
+		epfd:      -1,
+		wakeFd:    -1,
 	}
 
 	seenDevs := make(map[uint64]bool)
 
-	// Primary console (typically serial or os.Stdin)
+	// Primary console (typically serial or stdin fd 0)
 	if primaryFd >= 0 {
-		_ = syscall.SetNonblock(primaryFd, false)
 		var st syscall.Stat_t
 		if err := syscall.Fstat(primaryFd, &st); err == nil && st.Rdev != 0 {
 			seenDevs[st.Rdev] = true
@@ -56,33 +58,25 @@ func NewKeyboardListener(primaryFd int, secondaryPaths ...string) (*KeyboardList
 		if r := hideCursor(primaryFd); r != nil {
 			l.restores = append(l.restores, r)
 		}
-		var primFile *os.File
-		if primaryFd == int(os.Stdin.Fd()) {
-			primFile = os.Stdin
-		} else {
-			primFile = os.NewFile(uintptr(primaryFd), "primary")
-		}
-		l.startReader(primFile, true)
 	}
 
-	// Secondary consoles (/dev/tty0, /dev/tty1)
+	// Secondary consoles (/dev/tty0, /dev/tty1) opened as raw FDs without os.NewFile GC finalizers
 	for _, path := range secondaryPaths {
 		if path == "" {
 			continue
 		}
-		f, err := os.OpenFile(path, os.O_RDWR|syscall.O_CLOEXEC, 0)
+		fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 		if err != nil {
-			f, err = os.OpenFile(path, os.O_RDONLY|syscall.O_CLOEXEC, 0)
+			fd, err = syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 		}
 		if err != nil {
 			continue
 		}
-		fd := int(f.Fd())
 		var st syscall.Stat_t
 		if err := syscall.Fstat(fd, &st); err == nil && st.Rdev != 0 {
 			if seenDevs[st.Rdev] {
 				// Duplicate of primary or previously opened device
-				_ = f.Close()
+				_ = syscall.Close(fd)
 				continue
 			}
 			seenDevs[st.Rdev] = true
@@ -97,61 +91,108 @@ func NewKeyboardListener(primaryFd int, secondaryPaths ...string) (*KeyboardList
 		if r := hideCursor(fd); r != nil {
 			l.restores = append(l.restores, r)
 		}
-		l.files = append(l.files, f)
-		l.startReader(f, false)
+		l.ownedFds = append(l.ownedFds, fd)
 	}
 
+	l.ensureInit()
 	return l, nil
 }
 
-func (l *KeyboardListener) ensureInit() {
-	if l.keyChan == nil {
-		l.keyChan = make(chan byte, 512)
-		l.done = make(chan struct{})
-		if l.primaryFd >= 0 {
-			_ = syscall.SetNonblock(l.primaryFd, false)
-			var f *os.File
-			if l.primaryFd == int(os.Stdin.Fd()) {
-				f = os.Stdin
-			} else {
-				f = os.NewFile(uintptr(l.primaryFd), "primary")
-			}
-			l.startReader(f, true)
-		}
-		if l.ttyFd >= 0 {
-			f := os.NewFile(uintptr(l.ttyFd), "secondary")
-			l.startReader(f, false)
-		}
+func createEventFD() (int, error) {
+	fd, _, errno := syscall.Syscall(syscall.SYS_EVENTFD2, 0, uintptr(syscall.O_CLOEXEC|syscall.O_NONBLOCK), 0)
+	if errno != 0 {
+		return -1, errno
 	}
+	return int(fd), nil
 }
 
-func (l *KeyboardListener) startReader(f *os.File, isPrimary bool) {
-	if f == nil {
+func (l *KeyboardListener) ensureInit() {
+	if l.keyChan != nil {
 		return
 	}
-	go func() {
-		buf := make([]byte, 128)
-		for {
-			n, err := f.Read(buf)
-			if n > 0 {
-				for i := 0; i < n; i++ {
+	l.keyChan = make(chan byte, 512)
+	l.done = make(chan struct{})
+	l.loopDone = make(chan struct{})
+	l.epfd = -1
+	l.wakeFd = -1
+
+	epfd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
+	if err != nil {
+		close(l.loopDone)
+		return
+	}
+	wakeFd, err := createEventFD()
+	if err != nil {
+		_ = syscall.Close(epfd)
+		close(l.loopDone)
+		return
+	}
+	l.epfd = epfd
+	l.wakeFd = wakeFd
+
+	wakeEv := syscall.EpollEvent{Events: syscall.EPOLLIN, Fd: int32(wakeFd)}
+	_ = syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, wakeFd, &wakeEv)
+
+	addedFds := make(map[int]bool)
+	activeInputs := 0
+	addInput := func(fd int) {
+		if fd < 0 || addedFds[fd] {
+			return
+		}
+		ev := syscall.EpollEvent{Events: syscall.EPOLLIN, Fd: int32(fd)}
+		if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, fd, &ev); err == nil {
+			addedFds[fd] = true
+			activeInputs++
+		}
+	}
+
+	addInput(l.primaryFd)
+	addInput(l.ttyFd)
+	for _, fd := range l.ownedFds {
+		addInput(fd)
+	}
+
+	go l.epollLoop(epfd, wakeFd, activeInputs)
+}
+
+func (l *KeyboardListener) epollLoop(epfd, wakeFd, activeInputs int) {
+	defer close(l.loopDone)
+	var events [8]syscall.EpollEvent
+	var buf [128]byte
+
+	for {
+		n, err := syscall.EpollWait(epfd, events[:], -1)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			return
+		}
+		for i := 0; i < n; i++ {
+			fd := int(events[i].Fd)
+			if fd == wakeFd {
+				return
+			}
+			m, rerr := syscall.Read(fd, buf[:])
+			if m > 0 {
+				for j := 0; j < m; j++ {
 					select {
 					case <-l.done:
 						return
-					case l.keyChan <- buf[i]:
+					case l.keyChan <- buf[j]:
 					}
 				}
 			}
-			if err != nil {
-				return
-			}
-			select {
-			case <-l.done:
-				return
-			default:
+			if (m == 0 && rerr == nil) || (rerr != nil && rerr != syscall.EINTR && rerr != syscall.EAGAIN) {
+				_ = syscall.EpollCtl(epfd, syscall.EPOLL_CTL_DEL, fd, nil)
+				activeInputs--
+				if activeInputs <= 0 {
+					close(l.keyChan)
+					return
+				}
 			}
 		}
-	}()
+	}
 }
 
 // setRawMode puts fd into raw mode for character-at-a-time input without echo.
@@ -272,7 +313,8 @@ drain:
 	return out, true, false
 }
 
-// Close restores terminal states and closes all opened secondary descriptors.
+// Close wakes the epoll multiplexer via eventfd, restores terminal states,
+// and closes all owned descriptors without touching caller-owned primaryFd.
 func (l *KeyboardListener) Close() error {
 	l.mu.Lock()
 	if l.closed {
@@ -283,32 +325,48 @@ func (l *KeyboardListener) Close() error {
 	if l.done != nil {
 		close(l.done)
 	}
+	wakeFd := l.wakeFd
+	epfd := l.epfd
+	loopDone := l.loopDone
+	restores := l.restores
+	l.restores = nil
+	ownedFds := l.ownedFds
+	l.ownedFds = nil
+	l.wakeFd = -1
+	l.epfd = -1
+	l.ttyFd = -1
 	l.mu.Unlock()
 
-	// Ensure primary descriptor remains strictly in blocking mode
-	if l.primaryFd >= 0 {
-		_ = syscall.SetNonblock(l.primaryFd, false)
+	if wakeFd >= 0 {
+		var one = [8]byte{1, 0, 0, 0, 0, 0, 0, 0}
+		_, _ = syscall.Write(wakeFd, one[:])
+	}
+	if loopDone != nil {
+		<-loopDone
 	}
 
 	// Restore all termios and cursor modes
-	for i := len(l.restores) - 1; i >= 0; i-- {
-		if l.restores[i] != nil {
-			l.restores[i]()
+	for i := len(restores) - 1; i >= 0; i-- {
+		if restores[i] != nil {
+			restores[i]()
 		}
 	}
-	l.restores = nil
 
-	// Close opened secondary files to unblock reader goroutines
+	if wakeFd >= 0 {
+		_ = syscall.Close(wakeFd)
+	}
+	if epfd >= 0 {
+		_ = syscall.Close(epfd)
+	}
+
 	var firstErr error
-	for _, f := range l.files {
-		if f != nil {
-			if err := f.Close(); err != nil && firstErr == nil {
+	for _, fd := range ownedFds {
+		if fd >= 0 {
+			if err := syscall.Close(fd); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
 	}
-	l.files = nil
-	l.ttyFd = -1
 
 	return firstErr
 }
