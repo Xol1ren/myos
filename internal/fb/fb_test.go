@@ -117,8 +117,13 @@ func TestDesktopInteraction(t *testing.T) {
 	d.Update(st)
 	d.Draw(&c, st)
 
-	// Click the button inside window
-	bx, by, _, _ := d.buttonRect()
+	// Click the button inside Telemetry window
+	telWin := d.findWindowByKind(WinTelemetry)
+	if telWin == nil {
+		t.Fatal("missing telemetry window")
+	}
+	d.FocusWindow(telWin.ID)
+	bx, by, _, _ := d.telemetryButtonRect(telWin)
 	clickSt := input.State{X: bx + 5, Y: by + 5, Buttons: input.Left, W: 640, H: 480}
 	d.Update(clickSt)
 	if d.clicks != 1 {
@@ -494,12 +499,20 @@ func TestKeyboardListenerMultiplexing(t *testing.T) {
 
 func TestRouteInputTerminalRouting(t *testing.T) {
 	d := NewDesktop(1280, 800)
-	if d.Term == nil {
+	termWin := d.findWindowByKind(WinTerminal)
+	if termWin == nil || termWin.Term == nil {
 		t.Skip("skipping terminal test on platform without PTY support")
 	}
+	defer func() {
+		for _, w := range d.Windows {
+			if w.Term != nil {
+				_ = w.Term.Close()
+			}
+		}
+	}()
 
 	// Test routing control keys & runes
-	d.focusWin = 1
+	d.FocusWindow(termWin.ID)
 	quit := d.RouteInput([]byte("echo hi\r\n"))
 	if quit {
 		t.Fatal("RouteInput should not quit for standard input")
@@ -601,5 +614,84 @@ func TestKeyboardListenerPollTimeoutAndDrain(t *testing.T) {
 	n, err := p1r.Read(postBuf[:])
 	if err != nil || string(postBuf[:n]) != "post-close" {
 		t.Fatalf("expected 'post-close' to remain intact on primaryFd after Close(), got %q (err=%v)", string(postBuf[:n]), err)
+	}
+}
+
+func TestDesktopMultiWindowZOrderMinimizeCloseAndCap(t *testing.T) {
+	d := NewDesktop(1280, 800)
+	defer func() {
+		for _, w := range d.Windows {
+			if w.Term != nil {
+				_ = w.Term.Close()
+			}
+		}
+	}()
+
+	tel := d.findWindowByKind(WinTelemetry)
+	term1 := d.findWindowByKind(WinTerminal)
+	if tel == nil || term1 == nil {
+		t.Skip("skipping multi-window test without PTY support")
+	}
+
+	// Initially terminal is on top and focused.
+	if d.Windows[len(d.Windows)-1].ID != term1.ID || d.focusedID != term1.ID {
+		t.Fatalf("expected terminal focused on top, got focused=%d top=%d", d.focusedID, d.Windows[len(d.Windows)-1].ID)
+	}
+
+	// Click inside Telemetry window brings it to front and focuses it.
+	d.Update(input.State{X: tel.X + 10, Y: tel.Y + 40, Buttons: input.Left, W: 1280, H: 800})
+	d.Update(input.State{X: tel.X + 10, Y: tel.Y + 40, Buttons: 0, W: 1280, H: 800})
+	if d.Windows[len(d.Windows)-1].ID != tel.ID || d.focusedID != tel.ID {
+		t.Fatalf("expected telemetry focused on top after click, got focused=%d top=%d", d.focusedID, d.Windows[len(d.Windows)-1].ID)
+	}
+
+	// Click minimize button [-] on Telemetry.
+	mb := winMinButtonRect(tel)
+	d.Update(input.State{X: mb.x + 2, Y: mb.y + 2, Buttons: input.Left, W: 1280, H: 800})
+	d.Update(input.State{X: mb.x + 2, Y: mb.y + 2, Buttons: 0, W: 1280, H: 800})
+	if !tel.Minimized || d.focusedID != term1.ID {
+		t.Fatalf("expected telemetry minimized and term1 focused, min=%v focused=%d", tel.Minimized, d.focusedID)
+	}
+
+	// Click Telemetry task button in bottom dock to restore and focus it.
+	var telDock rect
+	for _, it := range d.dockItems(1280, 800) {
+		if it.win != nil && it.win.ID == tel.ID {
+			telDock = it.rect
+			break
+		}
+	}
+	d.Update(input.State{X: telDock.x + 4, Y: telDock.y + 4, Buttons: input.Left, W: 1280, H: 800})
+	d.Update(input.State{X: telDock.x + 4, Y: telDock.y + 4, Buttons: 0, W: 1280, H: 800})
+	if tel.Minimized || d.focusedID != tel.ID {
+		t.Fatalf("expected telemetry restored and focused, min=%v focused=%d", tel.Minimized, d.focusedID)
+	}
+
+	// Spawn up to maxTerminals (4) and verify cap + cascading coordinates.
+	t2 := d.SpawnTerminal()
+	t3 := d.SpawnTerminal()
+	t4 := d.SpawnTerminal()
+	if t2 == nil || t3 == nil || t4 == nil {
+		t.Fatal("failed to spawn terminals up to cap")
+	}
+	if t2.X == term1.X || t2.Y == term1.Y {
+		t.Fatalf("expected cascading coordinates, got t1=(%d,%d) t2=(%d,%d)", term1.X, term1.Y, t2.X, t2.Y)
+	}
+	_ = d.SpawnTerminal() // should not exceed 4
+	if d.terminalCount() != maxTerminals {
+		t.Fatalf("expected terminal count capped at %d, got %d", maxTerminals, d.terminalCount())
+	}
+
+	// Close term1 via close button [x] and verify PTY is closed.
+	d.FocusWindow(term1.ID)
+	cb := winCloseButtonRect(term1)
+	termObj := term1.Term
+	d.Update(input.State{X: cb.x + 2, Y: cb.y + 2, Buttons: input.Left, W: 1280, H: 800})
+	d.Update(input.State{X: cb.x + 2, Y: cb.y + 2, Buttons: 0, W: 1280, H: 800})
+	if termObj.IsActive() {
+		t.Fatal("expected closed terminal PTY to be inactive")
+	}
+	if d.terminalCount() != maxTerminals-1 {
+		t.Fatalf("expected %d terminals after close, got %d", maxTerminals-1, d.terminalCount())
 	}
 }
