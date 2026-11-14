@@ -68,7 +68,7 @@ run: build $(DISK_IMG)
 		-kernel $(KERNEL) -initrd $(INITRAMFS) \
 		-append "$(CMDLINE_TTY) quiet loglevel=3 rdinit=/init mousedev.xres=1280 mousedev.yres=800" \
 		-drive file=$(DISK_IMG),format=raw,if=virtio \
-		-net nic,model=e1000 -net user \
+		-net nic,model=e1000 -net user,hostfwd=tcp::8080-:8080 \
 		$(QEMU_MOUSE) \
 		$(DISPLAY_ARGS)
 

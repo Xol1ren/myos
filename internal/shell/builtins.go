@@ -65,6 +65,7 @@ func init() {
 		"mount":    biMount,
 		"umount":   biUmount,
 		"edit":     biEdit,
+		"httpd":    biHttpd,
 	}
 }
 
@@ -716,4 +717,45 @@ func biUmount(_ *Shell, io *IO, args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func biHttpd(_ *Shell, io *IO, args []string) int {
+	if len(args) < 2 {
+		fmt.Fprintln(io.Err, "usage: httpd <start [port]|stop|status>")
+		return 1
+	}
+	switch args[1] {
+	case "start":
+		addr := ":8080"
+		if len(args) >= 3 {
+			addr = args[2]
+		}
+		if err := netcfg.DefaultHTTPD.Start(addr); err != nil {
+			fmt.Fprintf(io.Err, "httpd start: %v\n", err)
+			return 1
+		}
+		_, bound := netcfg.DefaultHTTPD.Status()
+		fmt.Fprintf(io.Out, "httpd listening on %s\n", bound)
+		return 0
+	case "stop":
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := netcfg.DefaultHTTPD.Stop(ctx); err != nil {
+			fmt.Fprintf(io.Err, "httpd stop: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(io.Out, "httpd stopped")
+		return 0
+	case "status":
+		running, addr := netcfg.DefaultHTTPD.Status()
+		if running {
+			fmt.Fprintf(io.Out, "httpd running on %s\n", addr)
+		} else {
+			fmt.Fprintln(io.Out, "httpd stopped")
+		}
+		return 0
+	default:
+		fmt.Fprintln(io.Err, "usage: httpd <start [port]|stop|status>")
+		return 1
+	}
 }
